@@ -3,6 +3,7 @@ name: CI
 on:
   push:
     branches: [main]
+    tags: ['v*.*.*']
   pull_request:
 
 permissions:
@@ -209,3 +210,20 @@ jobs:
           arch: ${{ matrix.arch }}
           ts: ${{ matrix.ts }}
           args: --enable-deepclone
+
+  release:
+    # On tag pushes, collect every Windows build artifact uploaded by the
+    # `windows` matrix above and attach the resulting DLLs to the GitHub
+    # release. PIE will then download the matching prebuilt DLL on Windows
+    # instead of asking the user to compile from source.
+    name: "Publish Windows DLLs to release"
+    needs: windows
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: php/php-windows-builder/release@v1
+        with:
+          release: ${{ github.ref }}
+          token: ${{ secrets.GITHUB_TOKEN }}

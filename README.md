@@ -61,6 +61,10 @@ other.
 pie install symfony/deepclone
 ```
 
+On Linux and macOS, PIE compiles from source. On Windows, PIE downloads
+the prebuilt DLL matching your PHP version, architecture, and TS/NTS flavor
+from the GitHub release — no MSVC or PHP SDK required.
+
 Then enable the extension in your `php.ini`:
 
 ```ini
