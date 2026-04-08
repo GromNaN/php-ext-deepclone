@@ -39,8 +39,22 @@
 extern PHPAPI zend_class_entry *reflector_ptr;
 extern PHPAPI zend_class_entry *reflection_type_ptr;
 
-/* ── Compatibility shims for PHP < 8.4 ─────────────────────── */
+/* ── Compatibility shims for older PHP versions ────────────── */
+
+/* zend_zval_value_name() landed in PHP 8.3 (returns "true"/"false"/"null"
+ * /numeric literals as appropriate). On 8.2 fall back to the older
+ * zend_zval_type_name() which returns just the type name ("bool", "int", …).
+ * Slightly less informative, same printf format. */
+#if PHP_VERSION_ID < 80300
+# define zend_zval_value_name(zv) zend_zval_type_name(zv)
+#endif
+
 #if PHP_VERSION_ID < 80400
+/* rebuild_object_properties_internal() was introduced in 8.4 alongside the
+ * zend_std_build_properties() refactor. On 8.2/8.3 the equivalent is the
+ * older rebuild_object_properties() (no "_internal" suffix). */
+# define rebuild_object_properties_internal(obj) rebuild_object_properties(obj)
+
 /* Lazy objects landed in PHP 8.4. Pre-8.4 has no such concept, so the
  * "is this a lazy object?" check is always false and we degrade to the
  * normal walk path. */
@@ -2077,7 +2091,13 @@ PHP_FUNCTION(deepclone_from_array)
 					zend_hash_add_new(&ce_cache, scope_name, &zce);
 				}
 			}
+			/* PHP 8.5+ made EG(fake_scope) a const pointer (#19060). The
+			 * shim casts the read so we keep one source for both worlds. */
+#if PHP_VERSION_ID >= 80500
+			const zend_class_entry *old_scope = EG(fake_scope);
+#else
 			zend_class_entry *old_scope = EG(fake_scope);
+#endif
 			if (scope_ce && scope_ce != zend_standard_class_def) {
 				EG(fake_scope) = scope_ce;
 			}
