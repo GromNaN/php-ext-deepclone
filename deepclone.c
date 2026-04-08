@@ -1929,9 +1929,14 @@ PHP_FUNCTION(deepclone_from_array)
 		if (n < 0) {
 			DC_INVALID("deepclone_from_array(): Argument #1 ($data) \"objectMeta\" count must be non-negative, " ZEND_LONG_FMT " given", n);
 		}
-		if (n > UINT32_MAX) {
+		/* On 64-bit zend_long is int64_t and n can exceed UINT32_MAX; on
+		 * 32-bit it's int32_t and the comparison is tautologically false
+		 * (-Werror=type-limits would reject it), so guard the upper bound. */
+#if SIZEOF_ZEND_LONG > 4
+		if (n > (zend_long)UINT32_MAX) {
 			DC_INVALID("deepclone_from_array(): Argument #1 ($data) \"objectMeta\" count out of range: " ZEND_LONG_FMT, n);
 		}
+#endif
 		num_objects = (uint32_t) n;
 		if (num_objects > 0) {
 			if (num_classes < 1) {

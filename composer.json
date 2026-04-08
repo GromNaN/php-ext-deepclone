@@ -20,8 +20,7 @@
         "source": "https://github.com/symfony/php-ext-deepclone"
     },
     "require": {
-        "php": ">=8.2",
-        "php-64bit": "*"
+        "php": ">=8.2"
     },
     "php-ext": {
         "extension-name": "deepclone",

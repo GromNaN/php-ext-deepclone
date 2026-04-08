@@ -48,8 +48,7 @@ other.
 
 ## Requirements
 
-- PHP **8.2** or later (NTS or ZTS)
-- 64-bit platform
+- PHP **8.2** or later (NTS or ZTS, 64-bit and 32-bit)
 - `ext-reflection` and `ext-spl` (always present in stock PHP builds)
 
 ## Installation
