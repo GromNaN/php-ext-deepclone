@@ -178,33 +178,62 @@ jobs:
           NO_INTERACTION=1 REPORT_EXIT_STATUS=1 make test TESTS="-q tests/"
 
   windows:
-    # Windows builds use the PHP SDK + MSVC. Marked experimental until the
-    # incantation is locked down; failures here are informational.
-    name: "Windows ${{ matrix.php }} ${{ matrix.arch }}"
+    # Windows builds need both the PHP SDK (for headers, phpize, nmake) and
+    # an MSVC dev prompt. shivammathur/setup-php only ships the runtime, so
+    # we use php/setup-php-sdk + ilammy/msvc-dev-cmd which between them give
+    # us a proper extension build environment.
+    name: "Windows ${{ matrix.php }} ${{ matrix.arch }} ${{ matrix.ts }}"
     runs-on: windows-latest
-    continue-on-error: true
     strategy:
       fail-fast: false
       matrix:
         php: ['8.3', '8.4']
         arch: [x64]
+        ts: [nts, ts]
 
     steps:
       - uses: actions/checkout@v6
 
-      - name: Setup PHP ${{ matrix.php }}
-        uses: shivammathur/setup-php@v2
+      - name: Setup PHP SDK
+        id: setup-php-sdk
+        uses: php/setup-php-sdk@v0.10
         with:
-          php-version: ${{ matrix.php }}
-          coverage: none
-          tools: none
+          version: ${{ matrix.php }}
+          arch: ${{ matrix.arch }}
+          ts: ${{ matrix.ts }}
 
-      - name: build & test
+      - name: Enable Developer Command Prompt
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: ${{ matrix.arch }}
+          toolset: ${{ steps.setup-php-sdk.outputs.toolset }}
+
+      - name: phpize
         shell: cmd
+        run: phpize
+
+      - name: configure
+        shell: cmd
+        run: configure --enable-deepclone --with-prefix=${{ steps.setup-php-sdk.outputs.prefix }}
+
+      - name: nmake
+        shell: cmd
+        run: nmake
+
+      - name: nmake test
+        shell: cmd
+        env:
+          NO_INTERACTION: "1"
+          REPORT_EXIT_STATUS: "1"
+        run: nmake test TESTS="tests/"
+
+      - name: Show failing test diffs
+        if: failure()
+        shell: bash
         run: |
-          phpize
-          configure --enable-deepclone=shared
-          nmake
-          set NO_INTERACTION=1
-          set REPORT_EXIT_STATUS=1
-          nmake test TESTS="tests/"
+          for f in tests/*.diff tests/*.out tests/*.log; do
+            [ -e "$f" ] || continue
+            echo "::group::$f"
+            cat "$f"
+            echo "::endgroup::"
+          done
