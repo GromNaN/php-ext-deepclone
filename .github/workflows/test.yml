@@ -177,63 +177,35 @@ jobs:
           make -j$(sysctl -n hw.ncpu)
           NO_INTERACTION=1 REPORT_EXIT_STATUS=1 make test TESTS="-q tests/"
 
-  windows:
-    # Windows builds need both the PHP SDK (for headers, phpize, nmake) and
-    # an MSVC dev prompt. shivammathur/setup-php only ships the runtime, so
-    # we use php/setup-php-sdk + ilammy/msvc-dev-cmd which between them give
-    # us a proper extension build environment.
-    name: "Windows ${{ matrix.php }} ${{ matrix.arch }} ${{ matrix.ts }}"
-    runs-on: windows-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        php: ['8.3', '8.4']
-        arch: [x64]
-        ts: [nts, ts]
-
+  windows-matrix:
+    # Generate a Windows build matrix (PHP version × arch × ts × VS toolset)
+    # via the official php/php-windows-builder action — the same recipe used
+    # by ext/xdebug, ext/apcu, ext/uopz and other PECL extensions.
+    name: "Windows build matrix"
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
     steps:
       - uses: actions/checkout@v6
-
-      - name: Setup PHP SDK
-        id: setup-php-sdk
-        uses: php/setup-php-sdk@v0.10
+      - id: matrix
+        uses: php/php-windows-builder/extension-matrix@v1
         with:
-          version: ${{ matrix.php }}
+          php-version-list: '8.2, 8.3, 8.4, 8.5'
+          arch-list: 'x64'
+
+  windows:
+    name: "Windows ${{ matrix.php-version }} ${{ matrix.arch }} ${{ matrix.ts }}"
+    needs: windows-matrix
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.windows-matrix.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Build the extension
+        uses: php/php-windows-builder/extension@v1
+        with:
+          php-version: ${{ matrix.php-version }}
           arch: ${{ matrix.arch }}
           ts: ${{ matrix.ts }}
-
-      - name: Enable Developer Command Prompt
-        uses: ilammy/msvc-dev-cmd@v1
-        with:
-          arch: ${{ matrix.arch }}
-          toolset: ${{ steps.setup-php-sdk.outputs.toolset }}
-
-      - name: phpize
-        shell: cmd
-        run: phpize
-
-      - name: configure
-        shell: cmd
-        run: configure --enable-deepclone --with-prefix=${{ steps.setup-php-sdk.outputs.prefix }}
-
-      - name: nmake
-        shell: cmd
-        run: nmake
-
-      - name: nmake test
-        shell: cmd
-        env:
-          NO_INTERACTION: "1"
-          REPORT_EXIT_STATUS: "1"
-        run: nmake test TESTS="tests/"
-
-      - name: Show failing test diffs
-        if: failure()
-        shell: bash
-        run: |
-          for f in tests/*.diff tests/*.out tests/*.log; do
-            [ -e "$f" ] || continue
-            echo "::group::$f"
-            cat "$f"
-            echo "::endgroup::"
-          done
+          args: --enable-deepclone
