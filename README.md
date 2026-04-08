@@ -3,9 +3,9 @@
 [![CI](https://github.com/symfony/php-ext-deepclone/actions/workflows/test.yml/badge.svg)](https://github.com/symfony/php-ext-deepclone/actions/workflows/test.yml)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-A PHP extension that accelerates Symfony's
-[`VarExporter\DeepCloner`](https://symfony.com/doc/current/components/var_exporter.html)
-by implementing its serialization format natively in C.
+**Export any serializable PHP value as a pure array — and rebuild it back into
+the original object graph.** Also doubles as a native accelerator for Symfony's
+[`VarExporter\DeepCloner`](https://symfony.com/doc/current/components/var_exporter.html).
 
 ## What it does
 
@@ -17,25 +17,34 @@ function deepclone_from_array(array $data): mixed;
 ```
 
 `deepclone_to_array()` walks any PHP value graph — objects, arrays, references,
-closures, enums, internal types — and returns a pure-array payload (only scalars
-and nested arrays, no objects, no resources). `deepclone_from_array()` rebuilds
-the original graph from such a payload.
+closures, enums, internal types — and returns a payload that contains **only
+scalars and nested arrays**: no objects, no resources, no surprises. Pass that
+payload to anything that handles plain PHP arrays — `json_encode()`,
+`var_export()`, APCu, igbinary, MessagePack, an HTTP body, a cache backend.
 
-The wire format is the one used by
-`Symfony\Component\VarExporter\DeepCloner::toArray()` / `::fromArray()`. The
-two implementations are interoperable: a payload produced by one side can be
-consumed by the other.
+`deepclone_from_array()` does the reverse: feed it the payload and it rebuilds
+the original graph, preserving object identity, internal references, private
+properties, `__wakeup` / `__unserialize` semantics, and so on.
+
+The wire format is the one used by Symfony's
+`VarExporter\DeepCloner::toArray()` / `::fromArray()`. The two implementations
+produce identical payloads, so you can produce on one side and consume on the
+other.
 
 ## Why
 
+- **A pure-array form for any value**, even ones that can't normally be JSON-encoded
+  (objects with private state, cycles, references, closures over named methods, …).
+  Once a graph is in array form it can travel through any serializer or cache
+  layer that doesn't speak PHP objects.
+- **Identity & reference preservation**: shared subgraphs stay shared, hard
+  references stay live, cycles round-trip cleanly. Unlike `json_encode()` or
+  `var_export()`, no information is lost on the way out.
 - **4–5× faster** than the pure-PHP `DeepCloner` implementation on `toArray()`
   and end-to-end `deepClone()`.
-- **On par with `unserialize(serialize($value))`**, while preserving copy-on-write
-  for strings and scalar arrays — so memory usage stays low when the input is
-  mostly immutable.
-- **Suitable for cache layers**: the payload is a plain array, so it can be
-  passed straight to `json_encode()`, `var_export()`, APCu, or any other
-  serializer that handles plain PHP arrays.
+- **On par with `unserialize(serialize($value))`**, while preserving
+  copy-on-write for strings and scalar arrays — so memory usage stays low when
+  the input is mostly immutable.
 
 ## Requirements
 

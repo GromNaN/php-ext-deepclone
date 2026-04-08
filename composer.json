@@ -1,6 +1,6 @@
 {
     "name": "symfony/deepclone",
-    "description": "Native acceleration for Symfony's VarExporter DeepCloner format",
+    "description": "Export any serializable PHP values as pure arrays - accelerator for Symfony's DeepCloner",
     "type": "php-ext",
     "license": "MIT",
     "keywords": ["deep", "clone", "deepclone", "var", "export", "serialize", "symfony"],
