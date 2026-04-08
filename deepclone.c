@@ -61,10 +61,14 @@ extern PHPAPI zend_class_entry *reflection_type_ptr;
 # define zend_object_is_lazy(obj) (0)
 
 /* Asymmetric visibility (set-only protected/private) landed in PHP 8.4.
- * Treat the flags as 0 on older PHP — symmetric visibility means the
- * checks naturally collapse to the public-write path. */
+ * On older PHP, readonly is the closest equivalent: a public-read property
+ * whose writes are forced into the declaring scope. Aliasing PROTECTED_SET
+ * to ZEND_ACC_READONLY makes the existing scope-resolution branch route
+ * readonly props through the declaring class on 8.2/8.3 — same outcome as
+ * the asymmetric-visibility path on 8.4+. PRIVATE_SET has no pre-8.4
+ * equivalent and stays 0. */
 # ifndef ZEND_ACC_PROTECTED_SET
-#  define ZEND_ACC_PROTECTED_SET (0)
+#  define ZEND_ACC_PROTECTED_SET ZEND_ACC_READONLY
 # endif
 # ifndef ZEND_ACC_PRIVATE_SET
 #  define ZEND_ACC_PRIVATE_SET (0)
