@@ -1,0 +1,33 @@
+{
+    "name": "symfony/deepclone",
+    "description": "Native acceleration for Symfony's VarExporter DeepCloner format",
+    "type": "php-ext",
+    "license": "MIT",
+    "keywords": ["deep", "clone", "deepclone", "var", "export", "serialize", "symfony"],
+    "homepage": "https://github.com/symfony/php-ext-deepclone",
+    "authors": [
+        {
+            "name": "Nicolas Grekas",
+            "email": "p@tchwork.com"
+        },
+        {
+            "name": "Symfony Community",
+            "homepage": "https://symfony.com/contributors"
+        }
+    ],
+    "support": {
+        "issues": "https://github.com/symfony/php-ext-deepclone/issues",
+        "source": "https://github.com/symfony/php-ext-deepclone"
+    },
+    "require": {
+        "php": ">=8.2",
+        "php-64bit": "*"
+    },
+    "php-ext": {
+        "extension-name": "deepclone",
+        "priority": 80,
+        "support-zts": true,
+        "support-nts": true,
+        "configure-options": []
+    }
+}

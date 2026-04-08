@@ -19,17 +19,43 @@
 
 #include "php.h"
 #include "php_deepclone.h"
+#include "deepclone_arginfo.h"
 #include "ext/standard/info.h"
 #include "ext/standard/php_var.h"
 #include "Zend/zend_smart_str.h"
 #include "ext/standard/php_incomplete_class.h"
 #include "Zend/zend_closures.h"
 #include "Zend/zend_exceptions.h"
-#include "Zend/zend_lazy_objects.h"
+#if PHP_VERSION_ID >= 80400
+# include "Zend/zend_lazy_objects.h"
+#endif
 #include "Zend/zend_enum.h"
 #include "Zend/zend_interfaces.h"
 #include "ext/spl/spl_iterators.h"
-#include "ext/reflection/php_reflection.h"
+
+/* ext/reflection's class entries are PHPAPI but Debian's php-dev does not
+ * ship ext/reflection/php_reflection.h. Forward-declare what we use; the
+ * linker resolves the symbols against the loaded PHP binary at runtime. */
+extern PHPAPI zend_class_entry *reflector_ptr;
+extern PHPAPI zend_class_entry *reflection_type_ptr;
+
+/* ── Compatibility shims for PHP < 8.4 ─────────────────────── */
+#if PHP_VERSION_ID < 80400
+/* Lazy objects landed in PHP 8.4. Pre-8.4 has no such concept, so the
+ * "is this a lazy object?" check is always false and we degrade to the
+ * normal walk path. */
+# define zend_object_is_lazy(obj) (0)
+
+/* Asymmetric visibility (set-only protected/private) landed in PHP 8.4.
+ * Treat the flags as 0 on older PHP — symmetric visibility means the
+ * checks naturally collapse to the public-write path. */
+# ifndef ZEND_ACC_PROTECTED_SET
+#  define ZEND_ACC_PROTECTED_SET (0)
+# endif
+# ifndef ZEND_ACC_PRIVATE_SET
+#  define ZEND_ACC_PRIVATE_SET (0)
+# endif
+#endif
 
 /* ── Permanent interned strings for output keys ───────────── */
 
@@ -2208,19 +2234,8 @@ cleanup:
 
 /* ── Module boilerplate ─────────────────────────────────────── */
 
-ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_deepclone_to_array, 0, 1, IS_ARRAY, 0)
-	ZEND_ARG_TYPE_INFO(0, value, IS_MIXED, 0)
-ZEND_END_ARG_INFO()
-
-ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_deepclone_from_array, 0, 1, IS_MIXED, 0)
-	ZEND_ARG_TYPE_INFO(0, data, IS_ARRAY, 0)
-ZEND_END_ARG_INFO()
-
-static const zend_function_entry deepclone_functions[] = {
-	PHP_FE(deepclone_to_array, arginfo_deepclone_to_array)
-	PHP_FE(deepclone_from_array, arginfo_deepclone_from_array)
-	PHP_FE_END
-};
+/* Function arginfo and ext_functions[] are generated from deepclone.stub.php
+ * into deepclone_arginfo.h — see the @generate-class-entries directive there. */
 
 PHP_MINIT_FUNCTION(deepclone)
 {
@@ -2269,7 +2284,7 @@ zend_module_entry deepclone_module_entry = {
 	NULL,
 	deepclone_deps,
 	"deepclone",
-	deepclone_functions,
+	ext_functions,
 	PHP_MINIT(deepclone),
 	NULL, /* MSHUTDOWN */
 	NULL, /* RINIT */

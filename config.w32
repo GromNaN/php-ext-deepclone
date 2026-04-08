@@ -1,0 +1,9 @@
+// vim:ft=javascript
+
+ARG_ENABLE("deepclone", "whether to enable deepclone support", "no");
+
+if (PHP_DEEPCLONE != "no") {
+	EXTENSION("deepclone", "deepclone.c");
+	ADD_EXTENSION_DEP('deepclone', 'reflection');
+	ADD_EXTENSION_DEP('deepclone', 'spl');
+}

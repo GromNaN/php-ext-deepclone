@@ -1,0 +1,169 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    name: "Linux ${{ matrix.php }} ${{ matrix.zts && 'ZTS' || 'NTS' }}"
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        php: ['8.2', '8.3', '8.4']
+        zts: [false]
+        include:
+          - php: '8.4'
+            zts: true
+          # 8.5 tracks the development branch (nightly); failures here are
+          # informational and must not block the matrix.
+          - php: '8.5'
+            zts: false
+            experimental: true
+    continue-on-error: ${{ matrix.experimental == true }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup PHP ${{ matrix.php }}
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php }}
+          coverage: none
+          tools: none
+        env:
+          phpts: ${{ matrix.zts && 'zts' || 'nts' }}
+
+      - name: phpize
+        run: phpize
+
+      - name: configure
+        run: ./configure --enable-deepclone CFLAGS="-Wall -Wextra -Werror -Wno-unused-parameter -Wno-sign-compare"
+
+      - name: make
+        run: make -j$(nproc)
+
+      - name: make test
+        run: |
+          export NO_INTERACTION=1
+          export REPORT_EXIT_STATUS=1
+          export TEST_PHP_JUNIT=junit.xml
+          make test TESTS="-q --show-diff tests/"
+
+      - name: Show failing test diffs
+        if: failure()
+        run: |
+          for f in tests/*.diff tests/*.out tests/*.log; do
+            [ -e "$f" ] || continue
+            echo "::group::$f"
+            cat "$f"
+            echo "::endgroup::"
+          done
+
+  asan:
+    name: "Linux 8.4 NTS + ASAN/UBSAN"
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup PHP 8.4 with ASAN
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.4'
+          coverage: none
+          tools: none
+
+      - name: phpize
+        run: phpize
+
+      - name: configure with sanitizers
+        run: |
+          export CFLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g -O1 -Wall -Wextra -Werror -Wno-unused-parameter -Wno-sign-compare"
+          export LDFLAGS="-fsanitize=address,undefined"
+          ./configure --enable-deepclone
+
+      - name: make
+        run: make -j$(nproc)
+
+      - name: make test
+        env:
+          ASAN_OPTIONS: "detect_leaks=0:abort_on_error=1:halt_on_error=1"
+          UBSAN_OPTIONS: "print_stacktrace=1:halt_on_error=1"
+          USE_ZEND_ALLOC: "0"
+          NO_INTERACTION: "1"
+          REPORT_EXIT_STATUS: "1"
+        run: make test TESTS="-q --show-diff tests/"
+
+      - name: Show failing test diffs
+        if: failure()
+        run: |
+          for f in tests/*.diff tests/*.out tests/*.log; do
+            [ -e "$f" ] || continue
+            echo "::group::$f"
+            cat "$f"
+            echo "::endgroup::"
+          done
+
+  macos:
+    name: "macOS ${{ matrix.php }}"
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        php: ['8.3', '8.4']
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup PHP ${{ matrix.php }}
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php }}
+          coverage: none
+          tools: none
+
+      - name: build & test
+        run: |
+          phpize
+          ./configure --enable-deepclone
+          make -j$(sysctl -n hw.ncpu)
+          NO_INTERACTION=1 REPORT_EXIT_STATUS=1 make test TESTS="-q tests/"
+
+  windows:
+    # Windows builds use the PHP SDK + MSVC. Marked experimental until the
+    # incantation is locked down; failures here are informational.
+    name: "Windows ${{ matrix.php }} ${{ matrix.arch }}"
+    runs-on: windows-latest
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        php: ['8.3', '8.4']
+        arch: [x64]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup PHP ${{ matrix.php }}
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php }}
+          coverage: none
+          tools: none
+
+      - name: build & test
+        shell: cmd
+        run: |
+          phpize
+          configure --enable-deepclone=shared
+          nmake
+          set NO_INTERACTION=1
+          set REPORT_EXIT_STATUS=1
+          nmake test TESTS="tests/"
