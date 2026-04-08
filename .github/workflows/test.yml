@@ -112,39 +112,35 @@ jobs:
           done
 
   linux32:
-    # Native 32-bit Linux build, exercised inside an i386 container that runs
-    # straight on the x86_64 host (no qemu needed). Debian Bookworm still
-    # ships PHP 8.2 on i386, which is enough to validate the source compiles
-    # and runs correctly when sizeof(zend_long) == 4.
+    # Native 32-bit Linux build. We can't use a `container:` block here
+    # because GitHub injects the x86_64 Node runtime into it and a pure
+    # i386 image can't execute it ("exec /__e/node24/bin/node: no such
+    # file or directory"). Instead, do checkout on the x86_64 host and
+    # spawn the i386 container manually for the build/test step. i386
+    # binaries run natively on x86_64 hosts — no qemu involved. Debian
+    # Bookworm still ships PHP 8.2 on i386, which is enough to validate
+    # the source compiles and runs correctly when sizeof(zend_long) == 4.
     name: "Linux i386 PHP 8.2"
     runs-on: ubuntu-latest
-    container:
-      image: i386/debian:bookworm
 
     steps:
-      - name: Install build deps
-        run: |
-          apt-get update
-          apt-get install -y --no-install-recommends \
-            build-essential autoconf pkg-config git ca-certificates \
-            php-cli php-dev
-
       - uses: actions/checkout@v6
 
-      - name: phpize
-        run: phpize
-
-      - name: configure
-        run: ./configure --enable-deepclone CFLAGS="-Wall -Wextra -Werror -Wno-unused-parameter -Wno-sign-compare"
-
-      - name: make
-        run: make -j$(nproc)
-
-      - name: make test
-        env:
-          NO_INTERACTION: "1"
-          REPORT_EXIT_STATUS: "1"
-        run: make test TESTS="-q --show-diff tests/"
+      - name: Build and test inside i386/debian:bookworm
+        run: |
+          docker run --rm --platform linux/386 -v "$PWD:/work" -w /work \
+            -e NO_INTERACTION=1 -e REPORT_EXIT_STATUS=1 \
+            i386/debian:bookworm sh -eu -c '
+              apt-get update
+              apt-get install -y --no-install-recommends \
+                build-essential autoconf pkg-config ca-certificates \
+                php-cli php-dev
+              phpize
+              ./configure --enable-deepclone \
+                CFLAGS="-Wall -Wextra -Werror -Wno-unused-parameter -Wno-sign-compare"
+              make -j"$(nproc)"
+              make test TESTS="-q --show-diff tests/"
+            '
 
       - name: Show failing test diffs
         if: failure()
