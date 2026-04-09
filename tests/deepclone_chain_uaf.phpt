@@ -57,9 +57,36 @@ foreach ([14, 100, 500] as $n) {
     check_chain_with_all($n);
 }
 
+/* Regression: dc_copy_value() used to cache `dc_ref_entry *ref_entry`
+ * across the recursive walk. When the walk grew ctx->refs (each
+ * `&$cur['next']` adds a hard-ref slot), the cached pointer became a
+ * dangling reference into freed memory and crashed in the post-walk
+ * `handle_value:` block. */
+function check_nested_refs(int $n): void {
+    $nested = [];
+    $cur = &$nested;
+    for ($i = 0; $i < $n; $i++) {
+        $cur['next'] = ['leaf' => $i];
+        $cur = &$cur['next'];
+    }
+    $arr = deepclone_to_array($nested);
+    $clone = deepclone_from_array($arr);
+    var_dump(serialize($nested) === serialize($clone));
+}
+
+foreach ([1, 8, 9, 16, 32, 100] as $n) {
+    check_nested_refs($n);
+}
+
 echo "ok\n";
 ?>
 --EXPECT--
+bool(true)
+bool(true)
+bool(true)
+bool(true)
+bool(true)
+bool(true)
 bool(true)
 bool(true)
 bool(true)
