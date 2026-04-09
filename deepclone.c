@@ -359,8 +359,17 @@ static uint8_t dc_get_class_info(dc_ctx *ctx, zend_class_entry *ce)
 	 * a misconfigured logger can't print secrets), so the property pipeline
 	 * sees nothing. Without this check the C extension would silently round-
 	 * trip a SensitiveParameterValue to a default-state instance — losing the
-	 * secret data. */
-	if (ce->ce_flags & ZEND_ACC_NOT_SERIALIZABLE) {
+	 * secret data.
+	 *
+	 * Same escape hatches as the existing anon-class / Reflection check below:
+	 * if a class declares its own (un)serialization API (Serializable interface,
+	 * __unserialize, __wakeup), trust the declaration. PHP itself stamps every
+	 * anonymous class with NOT_SERIALIZABLE (Zend/zend_compile.c) but Symfony
+	 * lets anonymous classes round-trip when they implement the magic methods,
+	 * so we have to honour the same exemption. */
+	if ((ce->ce_flags & ZEND_ACC_NOT_SERIALIZABLE)
+	 && !(flags & (DC_CI_HAS_UNSERIALIZE | DC_CI_HAS_WAKEUP))
+	 && ce->serialize == NULL) {
 		flags |= DC_CI_NOT_INSTANTIABLE;
 	}
 
