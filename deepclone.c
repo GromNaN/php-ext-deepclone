@@ -346,18 +346,35 @@ static uint8_t dc_get_class_info(dc_ctx *ctx, zend_class_entry *ce)
 		flags |= DC_CI_NOT_INSTANTIABLE;
 	}
 
-	/* Mark internal final classes as non-instantiable. PHP's
-	 * ReflectionClass::newInstanceWithoutConstructor() rejects them with
-	 * "internal class marked as final that cannot be instantiated without
-	 * invoking its constructor", which means the format we'd produce can't
-	 * round-trip. Hits Closure (anonymous), HashContext, etc.
-	 * Excluded: classes already routed via php_var_serialize (Serializable
-	 * and __PHP_Incomplete_Class), since those don't go through the
-	 * properties pipeline. */
+	/* Mark internal classes with hidden non-property state as non-instantiable.
+	 *
+	 * The signal is `ce->create_object != NULL`: when an internal class needs
+	 * storage beyond the standard zend_object (a file handle, a database
+	 * connection, a libzip pointer, …), it overrides create_object to allocate
+	 * its own subclass struct. Property serialization can't see those extra
+	 * fields, so reconstructing such a class via newInstanceWithoutConstructor +
+	 * property restoration silently produces an object in default-state.
+	 *
+	 * Escape hatches:
+	 *   - The legacy Serializable interface (ce->serialize set): the class
+	 *     handles its own (un)serialization through that path, and we route it
+	 *     via php_var_serialize separately.
+	 *   - __serialize / __unserialize / __sleep / __wakeup: modern equivalent.
+	 *     A class that defines any of these is asserting it can round-trip.
+	 *   - __PHP_Incomplete_Class: special-cased everywhere.
+	 *
+	 * What this catches that the previous (final-only) check did not:
+	 * SplFileInfo, SplFileObject, PDO, ZipArchive, mysqli_*, …
+	 *
+	 * What stays caught: Closure, Generator, HashContext, WeakMap, WeakReference.
+	 * What stays uncaught (correctly): ArrayObject, SplFixedArray, SplDoublyLinkedList,
+	 * SplObjectStorage, DateTime*, DateInterval, … — all of which define
+	 * __serialize/__unserialize.
+	 */
 	if (ce->type == ZEND_INTERNAL_CLASS
 	 && ce->create_object != NULL
-	 && (ce->ce_flags & ZEND_ACC_FINAL)
 	 && ce->serialize == NULL
+	 && !(flags & (DC_CI_HAS_SERIALIZE | DC_CI_HAS_UNSERIALIZE | DC_CI_HAS_SLEEP | DC_CI_HAS_WAKEUP))
 	 && ce != php_ce_incomplete_class) {
 		flags |= DC_CI_NOT_INSTANTIABLE;
 	}

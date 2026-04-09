@@ -103,6 +103,45 @@ foreach ($nonInstantiable as $label => $value) {
     }
 }
 
+// 4. Internal classes with hidden non-property state (custom create_object,
+//    no __serialize/__unserialize/__sleep/__wakeup, not Serializable) must be
+//    rejected. Property restoration would silently produce a default-state
+//    clone — e.g. an SplFileInfo with no path, a ZipArchive with no archive,
+//    a PDO with no connection. We catch them up-front instead of returning
+//    a corrupt clone.
+$hiddenState = [
+    'SplFileInfo' => new SplFileInfo('/etc/hostname'),
+    'ZipArchive'  => new ZipArchive(),
+];
+foreach ($hiddenState as $label => $value) {
+    try {
+        deepclone_to_array($value);
+        echo "4. $label: FAIL (no exception — would silently corrupt)\n";
+    } catch (\DeepClone\NotInstantiableException $e) {
+        echo "4. $label: OK (", $e->getMessage(), ")\n";
+    }
+}
+
+// 5. Internal classes that DO declare a serialization API must keep working.
+//    These all have __serialize/__unserialize and represent the real-world
+//    happy path for the heuristic above.
+$shouldRoundTrip = [
+    'ArrayObject'         => new ArrayObject([1, 2, 3]),
+    'SplFixedArray'       => SplFixedArray::fromArray([10, 20, 30]),
+    'SplObjectStorage'    => (function () { $s = new SplObjectStorage; $s[new stdClass] = 'v'; return $s; })(),
+    'DateTimeImmutable'   => new DateTimeImmutable('2026-04-08 12:00:00 UTC'),
+    'DateTimeZone'        => new DateTimeZone('Europe/Paris'),
+    'DateInterval'        => new DateInterval('P3DT4H'),
+];
+foreach ($shouldRoundTrip as $label => $value) {
+    try {
+        $clone = deepclone_from_array(deepclone_to_array($value));
+        echo "5. $label: ", get_debug_type($clone) === get_debug_type($value) ? 'OK' : 'FAIL', "\n";
+    } catch (\Throwable $e) {
+        echo "5. $label: FAIL (", $e::class, ': ', $e->getMessage(), ")\n";
+    }
+}
+
 echo "Done\n";
 ?>
 --EXPECT--
@@ -117,4 +156,12 @@ echo "Done\n";
 3. IteratorIterator: OK
 3. RecursiveIteratorIterator: OK
 3. anonymous class: OK
+4. SplFileInfo: OK (SplFileInfo)
+4. ZipArchive: OK (ZipArchive)
+5. ArrayObject: OK
+5. SplFixedArray: OK
+5. SplObjectStorage: OK
+5. DateTimeImmutable: OK
+5. DateTimeZone: OK
+5. DateInterval: OK
 Done

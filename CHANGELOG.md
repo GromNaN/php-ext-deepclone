@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `deepclone_to_array()` now rejects internal classes that hold non-property
+  state (custom `create_object` handler, no `__serialize` / `__unserialize` /
+  `__sleep` / `__wakeup`, not `Serializable`) by throwing
+  `DeepClone\NotInstantiableException`. Previously, such classes silently
+  round-tripped to a default-state instance, losing their hidden state.
+  Newly caught: `SplFileInfo`, `SplFileObject`, `PDO`, `ZipArchive`,
+  `mysqli` and friends.
+  Classes that declare a serialization API are unaffected (`ArrayObject`,
+  `SplFixedArray`, `SplDoublyLinkedList`, `SplObjectStorage`, `DateTime*`,
+  `DateInterval`, `DateTimeZone`, `DatePeriod`, …).
+
 ## [0.1.0] - 2026-04-08
 
 ### Added
