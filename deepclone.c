@@ -635,6 +635,55 @@ static void dc_copy_array(dc_ctx *ctx, HashTable *src_ht, zval *dst, zval *mask_
 	 * PHP's HT and get skipped by ZEND_HASH_FOREACH/zend_hash_apply. */
 	array_init_size(mask_dst, n);
 
+	/* Fast path: dense packed source array. Use ZEND_HASH_FILL_PACKED to
+	 * bulk-fill dst with UNDEFs and mask with NULLs in two tight passes,
+	 * then walk src with the packed-only iterator (no indirect/key-extraction
+	 * branch per element) and advance direct pointers into dst->arPacked /
+	 * mask->arPacked in lockstep. This bypasses the per-element
+	 * zend_hash_add_new function call the generic path makes.
+	 *
+	 * Requires `HT_IS_WITHOUT_HOLES`: if src has IS_UNDEF tombstones,
+	 * ZEND_HASH_PACKED_FOREACH_VAL skips them, which would break the
+	 * lockstep slot advance. Sparse-packed arrays are rare in practice
+	 * (user data graphs don't usually unset elements) and fall through
+	 * to the generic loop below. */
+	if (EXPECTED(HT_IS_PACKED(src_ht) && HT_IS_WITHOUT_HOLES(src_ht))) {
+		HashTable *dst_ht = Z_ARRVAL_P(dst);
+		HashTable *mask_ht = Z_ARRVAL_P(mask_dst);
+
+		/* array_init_size only reserves nTableSize; the underlying storage
+		 * isn't allocated until the first real insert. Force packed init so
+		 * arPacked is valid before FILL_PACKED writes to it. */
+		zend_hash_real_init_packed(dst_ht);
+		zend_hash_real_init_packed(mask_ht);
+
+		ZEND_HASH_FILL_PACKED(dst_ht) {
+			for (uint32_t i = 0; i < n; i++) {
+				ZVAL_UNDEF(__fill_val);
+				ZEND_HASH_FILL_NEXT();
+			}
+		} ZEND_HASH_FILL_END();
+
+		ZEND_HASH_FILL_PACKED(mask_ht) {
+			for (uint32_t i = 0; i < n; i++) {
+				ZEND_HASH_FILL_SET_NULL();
+				ZEND_HASH_FILL_NEXT();
+			}
+		} ZEND_HASH_FILL_END();
+
+		zval *dst_slot = dst_ht->arPacked;
+		zval *mask_slot = mask_ht->arPacked;
+		ZEND_HASH_PACKED_FOREACH_VAL(src_ht, src_val) {
+			dc_copy_value(ctx, src_val, dst_slot, mask_slot);
+			dst_slot++;
+			mask_slot++;
+		} ZEND_HASH_FOREACH_END();
+
+		return;
+	}
+
+	/* Generic path: hashed sources (string keys or sparse int keys) and
+	 * the sparse-packed-with-holes case. */
 	ZEND_HASH_FOREACH_KEY_VAL(src_ht, idx, key, src_val) {
 		zval undef, null_marker;
 		ZVAL_UNDEF(&undef);
