@@ -373,32 +373,40 @@ static uint8_t dc_get_class_info(dc_ctx *ctx, zend_class_entry *ce)
 		flags |= DC_CI_NOT_INSTANTIABLE;
 	}
 
-	/* Mark internal classes with hidden non-property state as non-instantiable.
+	/* Two complementary rules for internal classes with hidden non-property
+	 * state, both keyed on `ce->create_object != NULL` (the canonical signal
+	 * that the class allocates its own zend_object subclass with extra C-level
+	 * fields beyond the standard property table).
 	 *
-	 * The signal is `ce->create_object != NULL`: when an internal class needs
-	 * storage beyond the standard zend_object (a file handle, a database
-	 * connection, a libzip pointer, …), it overrides create_object to allocate
-	 * its own subclass struct. Property serialization can't see those extra
-	 * fields, so reconstructing such a class via newInstanceWithoutConstructor +
-	 * property restoration silently produces an object in default-state.
+	 * Rule A — internal final + create_object:
+	 * Mirrors Reflection's "internal class marked as final cannot be
+	 * instantiated without invoking its constructor" rule (see
+	 * ext/reflection/php_reflection.c). Any class that matches this rule
+	 * can't be reconstructed by Symfony's machinery regardless of whether
+	 * it declares __serialize / __unserialize, because the wider Symfony
+	 * pipeline relies on newInstanceWithoutConstructor() to build prototypes.
+	 * No magic-method escape hatch applies.
+	 * Hits: Closure, Generator, Fiber, HashContext, WeakMap, WeakReference.
 	 *
-	 * Escape hatches:
-	 *   - The legacy Serializable interface (ce->serialize set): the class
-	 *     handles its own (un)serialization through that path, and we route it
-	 *     via php_var_serialize separately.
-	 *   - __serialize / __unserialize / __sleep / __wakeup: modern equivalent.
-	 *     A class that defines any of these is asserting it can round-trip.
-	 *   - __PHP_Incomplete_Class: special-cased everywhere.
-	 *
-	 * What this catches that the previous (final-only) check did not:
-	 * SplFileInfo, SplFileObject, PDO, ZipArchive, mysqli_*, …
-	 *
-	 * What stays caught: Closure, Generator, HashContext, WeakMap, WeakReference.
-	 * What stays uncaught (correctly): ArrayObject, SplFixedArray, SplDoublyLinkedList,
-	 * SplObjectStorage, DateTime*, DateInterval, … — all of which define
+	 * Rule B — internal non-final + create_object + no declared serialization API:
+	 * Catches non-final internal classes that hold native state outside the
+	 * property table (file handles, database connections, libzip pointers, …)
+	 * and never bothered to declare a serialization API. Property restoration
+	 * would silently produce a default-state instance. Magic-method escape
+	 * hatches apply because a class that declares __serialize/__unserialize
+	 * is asserting it can round-trip.
+	 * Hits: SplFileInfo, SplFileObject, PDO, ZipArchive, mysqli_*, …
+	 * Doesn't hit (correctly): ArrayObject, SplFixedArray, SplDoublyLinkedList,
+	 * SplObjectStorage, DateTime*, DateInterval — they all declare
 	 * __serialize/__unserialize.
-	 */
+	 *
+	 * Rule A is checked first (no escape hatch), then Rule B as a fallback. */
 	if (ce->type == ZEND_INTERNAL_CLASS
+	 && ce->create_object != NULL
+	 && (ce->ce_flags & ZEND_ACC_FINAL)
+	 && ce != php_ce_incomplete_class) {
+		flags |= DC_CI_NOT_INSTANTIABLE;
+	} else if (ce->type == ZEND_INTERNAL_CLASS
 	 && ce->create_object != NULL
 	 && ce->serialize == NULL
 	 && !(flags & (DC_CI_HAS_SERIALIZE | DC_CI_HAS_UNSERIALIZE | DC_CI_HAS_SLEEP | DC_CI_HAS_WAKEUP))
