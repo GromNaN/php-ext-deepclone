@@ -348,7 +348,7 @@ static uint8_t dc_get_class_info(dc_ctx *ctx, zend_class_entry *ce)
 
 	/* Honour ZEND_ACC_NOT_SERIALIZABLE — the canonical "this class refuses
 	 * to be serialized" signal in modern PHP (8.1+). Set on Closure, Generator,
-	 * Fiber, WeakMap, WeakReference, SensitiveParameterValue, every intl/* class,
+	 * Fiber, WeakMap, WeakReference, SensitiveParameterValue, every intl class,
 	 * and anything else that explicitly opts out. Replaces the legacy
 	 * `ce->serialize == zend_class_serialize_deny` mechanism, which was removed
 	 * in PHP 8.1 (php/php-src@322864b5694) and is gone from every PHP version
