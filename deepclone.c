@@ -26,6 +26,15 @@
 #include "Zend/zend_closures.h"
 #include "Zend/zend_exceptions.h"
 #include "Zend/zend_call_stack.h"
+
+/* zend_call_stack_size_error() exists since PHP 8.3, but its declaration was
+ * only added to Zend/zend_execute.h in php-src@443aa29dbe2 (Sept 2024 → PHP
+ * 8.4). Forward-declare it on older versions so we can still call it without
+ * -Werror=implicit-function-declaration. On PHP 8.2 the function itself
+ * doesn't exist, so dc_check_stack_limit() is a no-op there. */
+#if PHP_VERSION_ID >= 80300 && PHP_VERSION_ID < 80400
+ZEND_API zend_never_inline ZEND_COLD void ZEND_FASTCALL zend_call_stack_size_error(void);
+#endif
 #if PHP_VERSION_ID >= 80400
 # include "Zend/zend_lazy_objects.h"
 #endif
@@ -104,10 +113,12 @@ static zend_always_inline zend_class_entry *dc_register_internal_class_with_flag
  * throws \Error via zend_call_stack_size_error) when we're too deep.
  * dc_copy_value (the only recursive walker — dc_copy_array always goes
  * through dc_copy_value) calls this at its entry. No-op on platforms
- * that lack ZEND_CHECK_STACK_LIMIT. */
+ * that lack ZEND_CHECK_STACK_LIMIT (or on PHP 8.2, where
+ * zend_call_stack_size_error() does not yet exist — 8.2 callers still
+ * segfault on pathological depth, same as before this patch). */
 static zend_always_inline bool dc_check_stack_limit(void)
 {
-#ifdef ZEND_CHECK_STACK_LIMIT
+#if defined(ZEND_CHECK_STACK_LIMIT) && PHP_VERSION_ID >= 80300
 	if (UNEXPECTED(zend_call_stack_overflowed(EG(stack_limit)))) {
 		zend_call_stack_size_error();
 		return true;
