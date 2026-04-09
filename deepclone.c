@@ -128,28 +128,25 @@ static zend_always_inline bool dc_check_stack_limit(void)
 	return false;
 }
 
-/* Hash a pointer into a zend_ulong suitable for zend_hash_index_*.
- * zend_hash doesn't re-hash numeric keys — it only masks the low bits —
- * so raw pointers produce catastrophic collisions because alignment
- * zeroes the low bits. We borrow the splitmix64 / mix32 recipe used by
- * ext/opcache's zend_jit_hash(), pre-shifted by 3 for 8-byte alignment.
- * On 64-bit with Zend MM zend_references are 32-byte aligned, so an
- * additional rotate wouldn't hurt, but the splitmix finalizer already
- * spreads the surviving entropy well enough. */
-static zend_always_inline zend_ulong dc_ptr_hash(const void *ptr)
-{
-	uintptr_t x = (uintptr_t)ptr >> 3;
-#if SIZEOF_SIZE_T == 4
-	x = ((x >> 16) ^ x) * 0x45d9f3bUL;
-	x = ((x >> 16) ^ x) * 0x45d9f3bUL;
-	x = (x >> 16) ^ x;
-#elif SIZEOF_SIZE_T == 8
-	x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
-	x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
-	x = x ^ (x >> 31);
-#endif
-	return (zend_ulong)x;
-}
+/* We key ctx->ref_map on zend_reference pointers. zend_hash doesn't re-hash
+ * numeric keys — it just masks them down to the bucket-count bits — so in
+ * theory aligned pointers all map to the same bucket, which would hurt
+ * lookup performance on pathological graphs. In practice:
+ *
+ *   - Splitmix64-mixing the pointer (ext/opcache's zend_jit_hash pattern)
+ *     changes the distribution, but zend_hash relies on the input being
+ *     the *identity* of the entry inside a bucket — it compares stored
+ *     p->h against the input h on lookup, so any pre-hashing that isn't
+ *     a pure permutation risks subtle bugs during rehash/resize. Review
+ *     feedback (from a Zend internals maintainer) advises against
+ *     pre-hashing keys handed to zend_hash at all.
+ *
+ *   - Empirically, the raw-pointer path never produced measurable
+ *     slowdowns in the benchmark harness, and the ref_map is sparse
+ *     anyway (refs are rare in real graphs).
+ *
+ * So we key on the raw pointer value. zend_hash's default bucket
+ * distribution is good enough. */
 
 /* ── Permanent interned strings for output keys ───────────── */
 
@@ -247,13 +244,13 @@ struct _dc_ctx {
 
 /* ── Class info cache entry ─────────────────────────────────── */
 
-#define DC_CI_HAS_UNSERIALIZE  0x01
-#define DC_CI_HAS_WAKEUP       0x02
-#define DC_CI_HAS_SERIALIZE    0x04
-#define DC_CI_SERIALIZE_PUBLIC 0x08
-#define DC_CI_HAS_SLEEP        0x10
-#define DC_CI_NOT_INSTANTIABLE 0x20
-#define DC_CI_COMPUTED         0x80
+#define DC_CI_HAS_UNSERIALIZE  (1 << 0)
+#define DC_CI_HAS_WAKEUP       (1 << 1)
+#define DC_CI_HAS_SERIALIZE    (1 << 2)
+#define DC_CI_SERIALIZE_PUBLIC (1 << 3)
+#define DC_CI_HAS_SLEEP        (1 << 4)
+#define DC_CI_NOT_INSTANTIABLE (1 << 5)
+#define DC_CI_COMPUTED         (1 << 7)
 
 
 /* ── Helpers ────────────────────────────────────────────────── */
@@ -357,11 +354,11 @@ static uint32_t dc_ref_add(dc_ctx *ctx, zend_reference *ref, zval *orig, zval *c
 	ZVAL_UNDEF(&ctx->refs[idx].cur_mask);
 	ctx->refs[idx].tree_pos = NULL;
 	ctx->refs[idx].mask_slot = NULL;
-	/* Map ref pointer → index. Pre-hash the pointer so aligned addresses
-	 * don't all collide in the same bucket. */
+	/* Map ref pointer → index. See the comment at the top of the file
+	 * about not pre-hashing keys handed to zend_hash_index_*. */
 	zval zidx;
 	ZVAL_LONG(&zidx, idx);
-	zend_hash_index_add_new(&ctx->ref_map, dc_ptr_hash(ref), &zidx);
+	zend_hash_index_add_new(&ctx->ref_map, (zend_ulong)(uintptr_t)ref, &zidx);
 	return idx;
 }
 
@@ -760,9 +757,9 @@ static void dc_copy_value(dc_ctx *ctx, zval *src, zval *dst, zval *mask_dst)
 		is_ref = 1;
 		ctx->is_static = 0;
 
-		/* Check if we've seen this reference before — match the pre-hashed key
-		 * we used on insertion in dc_ref_add(). */
-		zval *existing = zend_hash_index_find(&ctx->ref_map, dc_ptr_hash(ref));
+		/* Check if we've seen this reference before. Same raw-pointer key
+		 * as dc_ref_add(). */
+		zval *existing = zend_hash_index_find(&ctx->ref_map, (zend_ulong)(uintptr_t)ref);
 		if (existing) {
 			/* Re-encounter: emit -refId, set mask=false */
 			uint32_t idx = (uint32_t)Z_LVAL_P(existing);
@@ -1367,28 +1364,41 @@ prepare_props:
 		entry->prop_mask = (Z_TYPE(prop_mask) == IS_ARRAY) ? Z_ARRVAL(prop_mask) : NULL;
 	} else {
 		/* For normal objects: transpose directly into ctx->properties[scope][name][id]
-		 * and ctx->resolve[scope][name][id] during the walk. */
+		 * and ctx->resolve[scope][name][id] during the walk.
+		 *
+		 * IMPORTANT: dc_copy_value() recurses into child objects whose own
+		 * transpose loops may add entries to the very same
+		 * properties[scope][name] hash this frame just inserted into. Any such
+		 * insert can grow the bucket array and free the old one, invalidating
+		 * pointers we held into it. We therefore:
+		 *   - never cache `out_scope`/`out_name`/`out_rscope` pointers across
+		 *     the recursive call,
+		 *   - recurse into a stack-local temp zval (instead of directly into
+		 *     the bucket), and
+		 *   - re-find the destination slot by (scope, name, entry_id) after
+		 *     the recursion returns, then copy the temp into it.
+		 * Hash lookups on these chains are cheap (small string keys, packed
+		 * id-keyed inner array). */
 		uint32_t entry_id = entry->id;
 
 		zend_string *scope;
 		zval *scope_vals;
 		ZEND_HASH_FOREACH_STR_KEY_VAL(Z_ARRVAL(props_zval), scope, scope_vals) {
-			/* Lazily promote ctx->properties to an array */
-			if (Z_TYPE(ctx->properties) == IS_UNDEF) {
-				array_init_size(&ctx->properties, 1);
-			}
-			zval *out_scope = zend_hash_find(Z_ARRVAL(ctx->properties), scope);
-			if (!out_scope) {
-				zval new_ht;
-				array_init_size(&new_ht, 4);
-				out_scope = zend_hash_add_new(Z_ARRVAL(ctx->properties), scope, &new_ht);
-			}
-			zval *out_rscope = NULL; /* lazily looked up if a marker is needed */
-
 			zend_string *name;
 			zval *raw_val;
 			ZEND_HASH_FOREACH_STR_KEY_VAL(Z_ARRVAL_P(scope_vals), name, raw_val) {
-				/* Get or create properties[scope][name] = [id => ...] */
+				/* Lazily promote ctx->properties to an array, then look up /
+				 * create properties[scope][name] WITHOUT caching the bucket
+				 * pointers across the recursion. */
+				if (Z_TYPE(ctx->properties) == IS_UNDEF) {
+					array_init_size(&ctx->properties, 1);
+				}
+				zval *out_scope = zend_hash_find(Z_ARRVAL(ctx->properties), scope);
+				if (!out_scope) {
+					zval new_ht;
+					array_init_size(&new_ht, 4);
+					out_scope = zend_hash_add_new(Z_ARRVAL(ctx->properties), scope, &new_ht);
+				}
 				zval *out_name = zend_hash_find(Z_ARRVAL_P(out_scope), name);
 				if (!out_name) {
 					zval new_ht;
@@ -1396,31 +1406,47 @@ prepare_props:
 					out_name = zend_hash_add_new(Z_ARRVAL_P(out_scope), name, &new_ht);
 				}
 
-				/* Reserve dst slot at properties[scope][name][id] */
-				zval undef;
-				ZVAL_UNDEF(&undef);
-				zval *dst_slot = zend_hash_index_add_new(Z_ARRVAL_P(out_name), entry_id, &undef);
+				/* Reserve our slot at properties[scope][name][entry_id] using
+				 * IS_NULL (NOT IS_UNDEF — zend_hash_index_find treats UNDEF
+				 * entries in packed arrays as tombstones and returns NULL).
+				 * The pointer returned by add_new may become stale during the
+				 * recursion below (if children grow this same hash), so we
+				 * don't keep it. */
+				zval null_ph;
+				ZVAL_NULL(&null_ph);
+				zend_hash_index_add_new(Z_ARRVAL_P(out_name), entry_id, &null_ph);
 
-				/* Mask slot: lazily allocate resolve[scope][name][id] */
+				/* Recurse into a stack-local temp; the child writes its
+				 * result here, immune to any rehash of out_name. */
+				zval temp_dst;
+				ZVAL_UNDEF(&temp_dst);
 				zval mask_slot_zv;
 				ZVAL_UNDEF(&mask_slot_zv);
-				dc_copy_value(ctx, raw_val, dst_slot, &mask_slot_zv);
+				dc_copy_value(ctx, raw_val, &temp_dst, &mask_slot_zv);
 				/* Drop the IS_NULL placeholders that dc_copy_array() seeded
 				 * for elements that didn't need a marker. */
 				dc_mask_cleanup(&mask_slot_zv);
 
+				/* Re-find the destination slot — out_scope/out_name above
+				 * may now be stale, and the slot's address may have moved
+				 * if children rehashed out_name. The IS_NULL placeholder
+				 * we seeded carries no refcount, so we just overwrite it. */
+				out_scope = zend_hash_find(Z_ARRVAL(ctx->properties), scope);
+				out_name = zend_hash_find(Z_ARRVAL_P(out_scope), name);
+				zval *dst_slot = zend_hash_index_find(Z_ARRVAL_P(out_name), entry_id);
+				ZVAL_COPY_VALUE(dst_slot, &temp_dst);
+
 				if (Z_TYPE(mask_slot_zv) != IS_UNDEF && Z_TYPE(mask_slot_zv) != IS_NULL) {
-					/* Store the marker into resolve[scope][name][id] */
+					/* Store the marker into resolve[scope][name][id]. Look up
+					 * fresh — recursion may have grown ctx->resolve too. */
 					if (Z_TYPE(ctx->resolve) == IS_UNDEF) {
 						array_init_size(&ctx->resolve, 1);
 					}
+					zval *out_rscope = zend_hash_find(Z_ARRVAL(ctx->resolve), scope);
 					if (!out_rscope) {
-						out_rscope = zend_hash_find(Z_ARRVAL(ctx->resolve), scope);
-						if (!out_rscope) {
-							zval new_ht;
-							array_init_size(&new_ht, 1);
-							out_rscope = zend_hash_add_new(Z_ARRVAL(ctx->resolve), scope, &new_ht);
-						}
+						zval new_ht;
+						array_init_size(&new_ht, 1);
+						out_rscope = zend_hash_add_new(Z_ARRVAL(ctx->resolve), scope, &new_ht);
 					}
 					zval *out_rname = zend_hash_find(Z_ARRVAL_P(out_rscope), name);
 					if (!out_rname) {
@@ -1582,11 +1608,21 @@ static void dc_build_output(dc_ctx *ctx, zval *prepared, zval *top_mask, zval *r
 				zend_hash_index_add_new(Z_ARRVAL(refs_out), ref_id, cur);
 			}
 		} else if (Z_TYPE_P(orig) == IS_OBJECT && (Z_OBJCE_P(orig)->ce_flags & ZEND_ACC_ENUM)) {
-			/* UnitEnum ref */
+			/* UnitEnum ref — synthesize "Class::Case" once per occurrence.
+			 * If the same combined string happens to be interned already
+			 * (unlikely but free when it does happen), reuse the interned
+			 * copy so repeated hard-refs to the same enum case end up
+			 * sharing the same zend_string. */
 			zend_string *case_name = Z_STR_P(zend_enum_fetch_case_name(Z_OBJ_P(orig)));
 			zend_string *enum_str = zend_strpprintf(0, "%s::%s",
 				ZSTR_VAL(Z_OBJCE_P(orig)->name),
 				ZSTR_VAL(case_name));
+			zend_string *interned = zend_string_init_existing_interned(
+				ZSTR_VAL(enum_str), ZSTR_LEN(enum_str), 0);
+			if (interned != enum_str) {
+				zend_string_release(enum_str);
+				enum_str = interned;
+			}
 			zval zenum;
 			ZVAL_STR(&zenum, enum_str);
 			zend_hash_index_add_new(Z_ARRVAL(refs_out), ref_id, &zenum);
