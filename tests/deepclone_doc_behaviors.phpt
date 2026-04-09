@@ -123,6 +123,25 @@ foreach ($hiddenState as $label => $value) {
     }
 }
 
+// 4b. Classes that explicitly opt out via ZEND_ACC_NOT_SERIALIZABLE must also
+//     be rejected. The canonical case is SensitiveParameterValue: it hides its
+//     $value field from (array) cast (so secrets don't leak through casting),
+//     so the C extension's property pipeline sees an empty bag and would
+//     otherwise silently round-trip to a default-state instance — losing the
+//     secret. The class also has the NOT_SERIALIZABLE flag set, which the
+//     extension now honours.
+$notSerializable = [
+    'SensitiveParameterValue' => new SensitiveParameterValue('super-secret-api-key'),
+];
+foreach ($notSerializable as $label => $value) {
+    try {
+        deepclone_to_array($value);
+        echo "4b. $label: FAIL (would silently lose hidden data)\n";
+    } catch (\DeepClone\NotInstantiableException $e) {
+        echo "4b. $label: OK (", $e->getMessage(), ")\n";
+    }
+}
+
 // 5. Internal classes that DO declare a serialization API must keep working.
 //    These all have __serialize/__unserialize and represent the real-world
 //    happy path for the heuristic above.
@@ -158,6 +177,7 @@ echo "Done\n";
 3. RecursiveIteratorIterator: OK
 3. anonymous class: OK
 4. SplFileInfo: OK (SplFileInfo)
+4b. SensitiveParameterValue: OK (SensitiveParameterValue)
 5. ArrayObject: OK
 5. SplFixedArray: OK
 5. SplObjectStorage: OK

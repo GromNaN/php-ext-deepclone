@@ -346,6 +346,24 @@ static uint8_t dc_get_class_info(dc_ctx *ctx, zend_class_entry *ce)
 		flags |= DC_CI_NOT_INSTANTIABLE;
 	}
 
+	/* Honour ZEND_ACC_NOT_SERIALIZABLE — the canonical "this class refuses
+	 * to be serialized" signal in modern PHP (8.1+). Set on Closure, Generator,
+	 * Fiber, WeakMap, WeakReference, SensitiveParameterValue, every intl/* class,
+	 * and anything else that explicitly opts out. Replaces the legacy
+	 * `ce->serialize == zend_class_serialize_deny` mechanism, which was removed
+	 * in PHP 8.1 (php/php-src@322864b5694) and is gone from every PHP version
+	 * we support.
+	 *
+	 * Critical case: SensitiveParameterValue. The class deliberately hides its
+	 * $value field from (array) cast via a custom cast_object handler (so that
+	 * a misconfigured logger can't print secrets), so the property pipeline
+	 * sees nothing. Without this check the C extension would silently round-
+	 * trip a SensitiveParameterValue to a default-state instance — losing the
+	 * secret data. */
+	if (ce->ce_flags & ZEND_ACC_NOT_SERIALIZABLE) {
+		flags |= DC_CI_NOT_INSTANTIABLE;
+	}
+
 	/* Mark internal classes with hidden non-property state as non-instantiable.
 	 *
 	 * The signal is `ce->create_object != NULL`: when an internal class needs
