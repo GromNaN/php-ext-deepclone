@@ -26,16 +26,16 @@
 #include "Zend/zend_closures.h"
 #include "Zend/zend_exceptions.h"
 
-/* zend_call_stack_size_error() / Zend/zend_call_stack.h ship from PHP 8.3
- * onwards, but the declaration was only added to Zend/zend_execute.h in
- * php-src@443aa29dbe2 (Sept 2024 → PHP 8.4). On 8.3 we include the header
- * and forward-declare the function. On 8.2 neither exists, so we skip the
- * include entirely and dc_check_stack_limit() compiles out to a no-op. */
-#if PHP_VERSION_ID >= 80300
+/* Stack-limit protection ships only from PHP 8.4. The helper symbol
+ * zend_call_stack_size_error() landed in 8.3 as a file-local `static`
+ * function and was promoted to an exported ZEND_API symbol only in
+ * php-src@443aa29dbe2 (Sept 2024 → PHP 8.4) when the declaration was
+ * added to Zend/zend_execute.h for phpdbg support. On 8.2 and 8.3 the
+ * extension can't call it, so dc_check_stack_limit() is a no-op there
+ * and those versions still segfault on pathological depth — same as
+ * any other pre-8.4 extension that didn't bother. */
+#if PHP_VERSION_ID >= 80400
 # include "Zend/zend_call_stack.h"
-# if PHP_VERSION_ID < 80400
-ZEND_API zend_never_inline ZEND_COLD void ZEND_FASTCALL zend_call_stack_size_error(void);
-# endif
 #endif
 #if PHP_VERSION_ID >= 80400
 # include "Zend/zend_lazy_objects.h"
@@ -114,13 +114,12 @@ static zend_always_inline zend_class_entry *dc_register_internal_class_with_flag
  * recursion. Mirrors php_serialize_check_stack_limit(): returns true (and
  * throws \Error via zend_call_stack_size_error) when we're too deep.
  * dc_copy_value (the only recursive walker — dc_copy_array always goes
- * through dc_copy_value) calls this at its entry. No-op on platforms
- * that lack ZEND_CHECK_STACK_LIMIT (or on PHP 8.2, where
- * zend_call_stack_size_error() does not yet exist — 8.2 callers still
- * segfault on pathological depth, same as before this patch). */
+ * through dc_copy_value) calls this at its entry. No-op on PHP < 8.4
+ * (see the header-include block above) or on platforms where
+ * ZEND_CHECK_STACK_LIMIT is disabled at configure time. */
 static zend_always_inline bool dc_check_stack_limit(void)
 {
-#if defined(ZEND_CHECK_STACK_LIMIT) && PHP_VERSION_ID >= 80300
+#if PHP_VERSION_ID >= 80400 && defined(ZEND_CHECK_STACK_LIMIT)
 	if (UNEXPECTED(zend_call_stack_overflowed(EG(stack_limit)))) {
 		zend_call_stack_size_error();
 		return true;
