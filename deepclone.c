@@ -19,7 +19,6 @@
 
 #include "php.h"
 #include "php_deepclone.h"
-#include "deepclone_arginfo.h"
 #include "ext/standard/info.h"
 #include "ext/standard/php_var.h"
 #include "Zend/zend_smart_str.h"
@@ -32,6 +31,7 @@
 #include "Zend/zend_enum.h"
 #include "Zend/zend_interfaces.h"
 #include "ext/spl/spl_iterators.h"
+#include "ext/spl/spl_exceptions.h"
 
 /* ext/reflection's class entries are PHPAPI but Debian's php-dev does not
  * ship ext/reflection/php_reflection.h. Forward-declare what we use; the
@@ -55,6 +55,23 @@ extern PHPAPI zend_class_entry *reflection_type_ptr;
  * older rebuild_object_properties() (no "_internal" suffix). */
 # define rebuild_object_properties_internal(obj) rebuild_object_properties(obj)
 
+/* zend_register_internal_class_with_flags() landed in PHP 8.4. The
+ * stub-generated registration code calls it for our DeepClone\* exception
+ * classes. On 8.2/8.3 fall back to zend_register_internal_class_ex() and set
+ * the flags afterwards. We currently always pass 0 flags, so the assignment
+ * is a no-op, but we keep it for future-proofing. */
+# define zend_register_internal_class_with_flags(ce, parent, flags) \
+    dc_register_internal_class_with_flags((ce), (parent), (flags))
+static zend_always_inline zend_class_entry *dc_register_internal_class_with_flags(
+    zend_class_entry *class_entry, zend_class_entry *parent_ce, uint32_t flags)
+{
+    zend_class_entry *registered = zend_register_internal_class_ex(class_entry, parent_ce);
+    if (flags) {
+        registered->ce_flags |= flags;
+    }
+    return registered;
+}
+
 /* Lazy objects landed in PHP 8.4. Pre-8.4 has no such concept, so the
  * "is this a lazy object?" check is always false and we degrade to the
  * normal walk path. */
@@ -74,6 +91,11 @@ extern PHPAPI zend_class_entry *reflection_type_ptr;
 #  define ZEND_ACC_PRIVATE_SET (0)
 # endif
 #endif
+
+/* The stub-generated header relies on the compat shims above (specifically
+ * zend_register_internal_class_with_flags on PHP < 8.4), so it has to be
+ * included after this point. */
+#include "deepclone_arginfo.h"
 
 /* ── Permanent interned strings for output keys ───────────── */
 
@@ -99,13 +121,12 @@ static zend_string *dc_str_line_mangled;            /* "\0*\0line" */
  * php_reflection.h doesn't export it). */
 static zend_class_entry *dc_ce_reflection_generator;
 
-/* Stable error codes set on \Exception instances thrown by deepclone_to_array()
- * / deepclone_from_array() so consumers (e.g. Symfony's NativeDeepClonerTrait)
- * can map them to domain-specific exception types without parsing message text.
- * The exception's message is the bare class/type name. The 573x prefix keeps
- * the values clear of common application codes (0, 1, 2, …). */
-#define DC_ERR_NOT_INSTANTIABLE 5731
-#define DC_ERR_CLASS_NOT_FOUND  5732
+/* Class entries for the exceptions thrown by deepclone_to_array() and
+ * deepclone_from_array(). Both extend \InvalidArgumentException; their bare
+ * message is the offending class or type name. Registered in MINIT via the
+ * stub-generated helpers in deepclone_arginfo.h. */
+static zend_class_entry *dc_ce_not_instantiable_exception;
+static zend_class_entry *dc_ce_class_not_found_exception;
 
 /* ── Forward declarations ───────────────────────────────────── */
 
@@ -602,7 +623,7 @@ static void dc_copy_value(dc_ctx *ctx, zval *src, zval *dst, zval *mask_dst)
 
 	/* ── Resource (cold — rejected to match PHP DeepCloner) ── */
 	if (UNEXPECTED(Z_TYPE_P(src) == IS_RESOURCE)) {
-		zend_throw_exception_ex(zend_ce_exception, DC_ERR_NOT_INSTANTIABLE,
+		zend_throw_exception_ex(dc_ce_not_instantiable_exception, 0,
 			"%s resource", zend_rsrc_list_get_rsrc_type(Z_RES_P(src)));
 		return;
 	}
@@ -781,7 +802,7 @@ static void dc_process_object(dc_ctx *ctx, zval *src, zval *dst, zval *mask_dst)
 
 	/* ── Reject non-instantiable classes (Reflection*, *IteratorIterator) ── */
 	if (UNEXPECTED(ci & DC_CI_NOT_INSTANTIABLE)) {
-		zend_throw_exception_ex(zend_ce_exception, DC_ERR_NOT_INSTANTIABLE,
+		zend_throw_exception_ex(dc_ce_not_instantiable_exception, 0,
 			"%s", ZSTR_VAL(ce->name));
 		zval_ptr_dtor(&props_zval);
 		return;
@@ -2015,7 +2036,7 @@ PHP_FUNCTION(deepclone_from_array)
 			} else {
 				ce = zend_lookup_class(class_name);
 				if (!ce) {
-					zend_throw_exception_ex(zend_ce_exception, DC_ERR_CLASS_NOT_FOUND,
+					zend_throw_exception_ex(dc_ce_class_not_found_exception, 0,
 						"%s", ZSTR_VAL(class_name));
 					goto cleanup;
 				}
@@ -2290,6 +2311,15 @@ PHP_MINIT_FUNCTION(deepclone)
 	 * class table lookup is guaranteed to find it. */
 	dc_ce_reflection_generator = zend_hash_str_find_ptr(CG(class_table),
 		"reflectiongenerator", sizeof("reflectiongenerator") - 1);
+
+	/* Register \DeepClone\NotInstantiableException and
+	 * \DeepClone\ClassNotFoundException, both extending \InvalidArgumentException.
+	 * The registration helpers are generated from deepclone.stub.php into
+	 * deepclone_arginfo.h. */
+	dc_ce_not_instantiable_exception =
+		register_class_DeepClone_NotInstantiableException(spl_ce_InvalidArgumentException);
+	dc_ce_class_not_found_exception =
+		register_class_DeepClone_ClassNotFoundException(spl_ce_InvalidArgumentException);
 
 	return SUCCESS;
 }

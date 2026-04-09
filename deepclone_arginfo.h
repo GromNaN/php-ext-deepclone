@@ -1,5 +1,5 @@
 /* This is a generated file, edit deepclone.stub.php instead.
- * Stub hash: e23b7774f3b4c5b282b073d71a10d66618059023 */
+ * Stub hash: 3bfee38712974d8646672f34881023a33457657f */
 
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_deepclone_to_array, 0, 1, IS_ARRAY, 0)
 	ZEND_ARG_TYPE_INFO(0, value, IS_MIXED, 0)
@@ -17,3 +17,23 @@ static const zend_function_entry ext_functions[] = {
 	ZEND_FE(deepclone_from_array, arginfo_deepclone_from_array)
 	ZEND_FE_END
 };
+
+static zend_class_entry *register_class_DeepClone_NotInstantiableException(zend_class_entry *class_entry_InvalidArgumentException)
+{
+	zend_class_entry ce, *class_entry;
+
+	INIT_NS_CLASS_ENTRY(ce, "DeepClone", "NotInstantiableException", NULL);
+	class_entry = zend_register_internal_class_with_flags(&ce, class_entry_InvalidArgumentException, 0);
+
+	return class_entry;
+}
+
+static zend_class_entry *register_class_DeepClone_ClassNotFoundException(zend_class_entry *class_entry_InvalidArgumentException)
+{
+	zend_class_entry ce, *class_entry;
+
+	INIT_NS_CLASS_ENTRY(ce, "DeepClone", "ClassNotFoundException", NULL);
+	class_entry = zend_register_internal_class_with_flags(&ce, class_entry_InvalidArgumentException, 0);
+
+	return class_entry;
+}

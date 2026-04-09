@@ -16,7 +16,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Symfony\Component\VarExporter\DeepCloner::toArray()`.
 - `deepclone_from_array(array $data): mixed` — reconstructs a value graph
   from a payload previously produced by `deepclone_to_array()`.
-- Stable error codes on `\Exception` instances thrown by both functions:
-  `5731` (DC_ERR_NOT_INSTANTIABLE) and `5732` (DC_ERR_CLASS_NOT_FOUND).
-  The exception message is the bare class/type name.
-- Compatible with PHP 8.2 through 8.5, NTS and ZTS builds.
+- Two typed exceptions under the `DeepClone\` namespace, both extending
+  `\InvalidArgumentException`:
+  - `DeepClone\NotInstantiableException` — thrown by `deepclone_to_array()`
+    when the input contains a resource or a non-instantiable class
+    (anonymous class, `Reflection*`, `*IteratorIterator`, …).
+  - `DeepClone\ClassNotFoundException` — thrown by `deepclone_from_array()`
+    when the payload references a class that no longer exists.
+  In both cases the exception message is the bare class or type name.
+- Compatible with PHP 8.2 through 8.5, NTS and ZTS builds, on x86_64 and
+  i386 Linux, macOS, and Windows.

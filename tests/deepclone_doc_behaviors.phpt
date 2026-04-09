@@ -5,10 +5,11 @@ deepclone
 --FILE--
 <?php
 
-// 1. Missing class on deepclone_from_array — must throw an \Exception with code
-//    5732 (DC_ERR_CLASS_NOT_FOUND) and the bare class name as the message, so
-//    that a PHP-side wrapper (e.g. Symfony's NativeDeepClonerTrait) can wrap it
-//    into its own ClassNotFoundException without parsing message text.
+// 1. Missing class on deepclone_from_array — must throw a
+//    \DeepClone\ClassNotFoundException (an \InvalidArgumentException subclass)
+//    with the bare class name as the message, so that a PHP-side wrapper
+//    (e.g. Symfony's NativeDeepClonerTrait) can rewrap it into its own
+//    ClassNotFoundException via instanceof.
 try {
     deepclone_from_array([
         'classes' => 'NonExistentClassXyz',
@@ -17,8 +18,9 @@ try {
         'properties' => ['NonExistentClassXyz' => ['foo' => ['bar']]],
     ]);
     echo "1. FAIL: no exception\n";
-} catch (\Exception $e) {
-    echo '1. caught: ', $e::class, ' code=', $e->getCode(), ' msg=', $e->getMessage(), "\n";
+} catch (\InvalidArgumentException $e) {
+    $ok = $e instanceof \DeepClone\ClassNotFoundException && $e->getMessage() === 'NonExistentClassXyz';
+    echo '1. ', $ok ? 'OK' : 'FAIL', ': ', $e::class, ' msg=', $e->getMessage(), "\n";
 }
 
 // 2a. SplObjectStorage: identity preservation when an object appears both as a
@@ -92,9 +94,11 @@ foreach ($nonInstantiable as $label => $value) {
     try {
         deepclone_to_array($value);
         echo "3. $label: FAIL (no exception)\n";
-    } catch (\Exception $e) {
-        // Must be \Exception (not \Error) with code 5731 (DC_ERR_NOT_INSTANTIABLE).
-        $ok = $e::class === 'Exception' && 5731 === $e->getCode();
+    } catch (\InvalidArgumentException $e) {
+        // Must be a \DeepClone\NotInstantiableException with the bare class /
+        // type name as the message. The class also extends \InvalidArgumentException
+        // so older catch blocks targeting that base type still work.
+        $ok = $e instanceof \DeepClone\NotInstantiableException;
         echo "3. $label: ", $ok ? 'OK' : 'FAIL', "\n";
     }
 }
@@ -102,7 +106,7 @@ foreach ($nonInstantiable as $label => $value) {
 echo "Done\n";
 ?>
 --EXPECT--
-1. caught: Exception code=5732 msg=NonExistentClassXyz
+1. OK: DeepClone\ClassNotFoundException msg=NonExistentClassXyz
 2a. SplObjectStorage shared key: OK
 2b. SplObjectStorage shared value: OK
 2c. ArrayObject shared item: OK

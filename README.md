@@ -109,17 +109,25 @@ $copy = DeepCloner::deepClone($graph); // 4–5× faster with the extension load
 
 ## Error handling
 
-Both functions throw `\Exception` (with a stable code) when the input cannot
-be processed. The exception message is the bare class or type name; PHP-side
-wrappers (e.g. Symfony's `NativeDeepClonerTrait`) translate them into
-domain-specific exception types.
+Both functions throw a typed exception under the `DeepClone\` namespace when
+the input cannot be processed. Both exception classes extend
+`\InvalidArgumentException`, so existing `catch (\InvalidArgumentException $e)`
+blocks pick them up. The exception message is the bare class or type name.
 
-| Code | Constant                  | Meaning                                                          |
-| ---- | ------------------------- | ---------------------------------------------------------------- |
-| 5731 | `DC_ERR_NOT_INSTANTIABLE` | Resource, anonymous class, `Reflection*`, `*IteratorIterator`, … |
-| 5732 | `DC_ERR_CLASS_NOT_FOUND`  | Payload references a class that no longer exists                 |
+| Class                                | Thrown by                | Meaning                                                          |
+| ------------------------------------ | ------------------------ | ---------------------------------------------------------------- |
+| `DeepClone\NotInstantiableException` | `deepclone_to_array()`   | Resource, anonymous class, `Reflection*`, `*IteratorIterator`, … |
+| `DeepClone\ClassNotFoundException`   | `deepclone_from_array()` | Payload references a class that no longer exists                 |
 
 `deepclone_from_array()` additionally throws `\ValueError` on malformed input.
+
+```php
+try {
+    $payload = deepclone_to_array($graph);
+} catch (\DeepClone\NotInstantiableException $e) {
+    // $e->getMessage() === "ReflectionClass" (or "stream resource", …)
+}
+```
 
 ## Compatibility & stability
 
