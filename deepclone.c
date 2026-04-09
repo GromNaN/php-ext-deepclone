@@ -25,15 +25,17 @@
 #include "ext/standard/php_incomplete_class.h"
 #include "Zend/zend_closures.h"
 #include "Zend/zend_exceptions.h"
-#include "Zend/zend_call_stack.h"
 
-/* zend_call_stack_size_error() exists since PHP 8.3, but its declaration was
- * only added to Zend/zend_execute.h in php-src@443aa29dbe2 (Sept 2024 → PHP
- * 8.4). Forward-declare it on older versions so we can still call it without
- * -Werror=implicit-function-declaration. On PHP 8.2 the function itself
- * doesn't exist, so dc_check_stack_limit() is a no-op there. */
-#if PHP_VERSION_ID >= 80300 && PHP_VERSION_ID < 80400
+/* zend_call_stack_size_error() / Zend/zend_call_stack.h ship from PHP 8.3
+ * onwards, but the declaration was only added to Zend/zend_execute.h in
+ * php-src@443aa29dbe2 (Sept 2024 → PHP 8.4). On 8.3 we include the header
+ * and forward-declare the function. On 8.2 neither exists, so we skip the
+ * include entirely and dc_check_stack_limit() compiles out to a no-op. */
+#if PHP_VERSION_ID >= 80300
+# include "Zend/zend_call_stack.h"
+# if PHP_VERSION_ID < 80400
 ZEND_API zend_never_inline ZEND_COLD void ZEND_FASTCALL zend_call_stack_size_error(void);
+# endif
 #endif
 #if PHP_VERSION_ID >= 80400
 # include "Zend/zend_lazy_objects.h"
