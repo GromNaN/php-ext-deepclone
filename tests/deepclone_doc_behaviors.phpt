@@ -162,6 +162,16 @@ foreach ($shouldRoundTrip as $label => $value) {
     }
 }
 
+// 6. Resources at the top level are rejected, same as mid-tree. Previously
+//    the top-level fast path wrapped them in ['value' => $resource] and let
+//    them escape the walker entirely.
+try {
+    deepclone_to_array(STDIN);
+    echo "6. top-level resource: FAIL (no exception)\n";
+} catch (\DeepClone\NotInstantiableException $e) {
+    echo "6. top-level resource: OK (", $e->getMessage(), ")\n";
+}
+
 echo "Done\n";
 ?>
 --EXPECT--
@@ -184,4 +194,5 @@ echo "Done\n";
 5. DateTimeImmutable: OK
 5. DateTimeZone: OK
 5. DateInterval: OK
+6. top-level resource: OK (stream resource)
 Done

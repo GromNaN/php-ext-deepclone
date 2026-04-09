@@ -25,6 +25,7 @@
 #include "ext/standard/php_incomplete_class.h"
 #include "Zend/zend_closures.h"
 #include "Zend/zend_exceptions.h"
+#include "Zend/zend_call_stack.h"
 #if PHP_VERSION_ID >= 80400
 # include "Zend/zend_lazy_objects.h"
 #endif
@@ -96,6 +97,47 @@ static zend_always_inline zend_class_entry *dc_register_internal_class_with_flag
  * zend_register_internal_class_with_flags on PHP < 8.4), so it has to be
  * included after this point. */
 #include "deepclone_arginfo.h"
+
+/* Check whether the native call stack is about to overflow, the same way
+ * ext/standard/var.c guards php_var_serialize_intern against runaway
+ * recursion. Mirrors php_serialize_check_stack_limit(): returns true (and
+ * throws \Error via zend_call_stack_size_error) when we're too deep.
+ * dc_copy_value (the only recursive walker — dc_copy_array always goes
+ * through dc_copy_value) calls this at its entry. No-op on platforms
+ * that lack ZEND_CHECK_STACK_LIMIT. */
+static zend_always_inline bool dc_check_stack_limit(void)
+{
+#ifdef ZEND_CHECK_STACK_LIMIT
+	if (UNEXPECTED(zend_call_stack_overflowed(EG(stack_limit)))) {
+		zend_call_stack_size_error();
+		return true;
+	}
+#endif
+	return false;
+}
+
+/* Hash a pointer into a zend_ulong suitable for zend_hash_index_*.
+ * zend_hash doesn't re-hash numeric keys — it only masks the low bits —
+ * so raw pointers produce catastrophic collisions because alignment
+ * zeroes the low bits. We borrow the splitmix64 / mix32 recipe used by
+ * ext/opcache's zend_jit_hash(), pre-shifted by 3 for 8-byte alignment.
+ * On 64-bit with Zend MM zend_references are 32-byte aligned, so an
+ * additional rotate wouldn't hurt, but the splitmix finalizer already
+ * spreads the surviving entropy well enough. */
+static zend_always_inline zend_ulong dc_ptr_hash(const void *ptr)
+{
+	uintptr_t x = (uintptr_t)ptr >> 3;
+#if SIZEOF_SIZE_T == 4
+	x = ((x >> 16) ^ x) * 0x45d9f3bUL;
+	x = ((x >> 16) ^ x) * 0x45d9f3bUL;
+	x = (x >> 16) ^ x;
+#elif SIZEOF_SIZE_T == 8
+	x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
+	x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
+	x = x ^ (x >> 31);
+#endif
+	return (zend_ulong)x;
+}
 
 /* ── Permanent interned strings for output keys ───────────── */
 
@@ -286,8 +328,13 @@ static uint32_t dc_class_index(dc_ctx *ctx, zend_string *class_name)
 
 static uint32_t dc_ref_add(dc_ctx *ctx, zend_reference *ref, zval *orig, zval *current) {
 	if (ctx->refs_count >= ctx->refs_cap) {
-		ctx->refs_cap = ctx->refs_cap ? ctx->refs_cap * 2 : 8;
-		ctx->refs = erealloc(ctx->refs, ctx->refs_cap * sizeof(dc_ref_entry));
+		/* Grow by 1.5× instead of 2× — slightly less memory at high counts
+		 * while still amortised O(1). See folly's FBVector rationale. The
+		 * +1 covers the cap=1 edge case where (1 * 3) >> 1 == 1 (no growth),
+		 * and the `<8` floor keeps the very first allocation at a useful
+		 * size without going through two or three grow steps. */
+		ctx->refs_cap = ctx->refs_cap < 8 ? 8 : ((ctx->refs_cap * 3) >> 1) + 1;
+		ctx->refs = safe_erealloc(ctx->refs, ctx->refs_cap, sizeof(dc_ref_entry), 0);
 	}
 	uint32_t idx = ctx->refs_count++;
 	ctx->refs[idx].ref = ref;
@@ -298,10 +345,11 @@ static uint32_t dc_ref_add(dc_ctx *ctx, zend_reference *ref, zval *orig, zval *c
 	ZVAL_UNDEF(&ctx->refs[idx].cur_mask);
 	ctx->refs[idx].tree_pos = NULL;
 	ctx->refs[idx].mask_slot = NULL;
-	/* Map ref pointer → index */
+	/* Map ref pointer → index. Pre-hash the pointer so aligned addresses
+	 * don't all collide in the same bucket. */
 	zval zidx;
 	ZVAL_LONG(&zidx, idx);
-	zend_hash_index_add_new(&ctx->ref_map, (zend_ulong)(uintptr_t)ref, &zidx);
+	zend_hash_index_add_new(&ctx->ref_map, dc_ptr_hash(ref), &zidx);
 	return idx;
 }
 
@@ -539,13 +587,23 @@ static bool dc_array_is_static(HashTable *ht)
  * - mask_dst starts UNDEF; if the value needs a marker, we write it there.
  *   If no marker is needed, the slot stays UNDEF and the caller skips it.
  *
- * Mask markers:
- *   true  = object reference        (dst is the object pool ID)
- *   false = hard PHP &-reference    (dst is the negative ref ID)
- *   0     = named closure           (dst is the encoded callable array)
- *   'e'   = UnitEnum                (dst is "Class::Case")
- *   array = nested mask for sub-arrays
+ * Mask markers — use the DC_MASK_* macros below to set them so readers
+ * can grep for the intent rather than decoding raw zval types:
+ *   TRUE   = object reference        (dst is the object pool ID)
+ *   FALSE  = hard PHP &-reference    (dst is the negative ref ID)
+ *   LONG 0 = named closure           (dst is the encoded callable array)
+ *   'e'    = UnitEnum                (dst is "Class::Case")
+ *   ARRAY  = nested mask for sub-arrays
  */
+#define DC_MASK_OBJ_REF(m)        ZVAL_TRUE(m)
+#define DC_MASK_HARD_REF(m)       ZVAL_FALSE(m)
+#define DC_MASK_NAMED_CLOSURE(m)  ZVAL_LONG((m), 0)
+
+/* Test whether a mask slot carries a particular marker. */
+#define DC_MASK_IS_OBJ_REF(m)       (Z_TYPE_P(m) == IS_TRUE)
+#define DC_MASK_IS_HARD_REF(m)      (Z_TYPE_P(m) == IS_FALSE)
+#define DC_MASK_IS_NAMED_CLOSURE(m) (Z_TYPE_P(m) == IS_LONG && Z_LVAL_P(m) == 0)
+
 static void dc_copy_value(dc_ctx *ctx, zval *src, zval *dst, zval *mask_dst);
 static void dc_copy_array(dc_ctx *ctx, HashTable *src_ht, zval *dst, zval *mask_dst);
 
@@ -622,6 +680,14 @@ static void dc_mask_cleanup(zval *mask)
 
 static void dc_copy_value(dc_ctx *ctx, zval *src, zval *dst, zval *mask_dst)
 {
+	/* Bail out early if we're about to overflow the C stack. Throws \Error
+	 * via zend_call_stack_size_error(); callers propagate by checking
+	 * EG(exception), which is how the rest of this file already handles
+	 * errors. */
+	if (UNEXPECTED(dc_check_stack_limit())) {
+		return;
+	}
+
 	bool is_ref = 0;
 	dc_ref_entry *ref_entry = NULL;
 
@@ -633,14 +699,15 @@ static void dc_copy_value(dc_ctx *ctx, zval *src, zval *dst, zval *mask_dst)
 		is_ref = 1;
 		ctx->is_static = 0;
 
-		/* Check if we've seen this reference before */
-		zval *existing = zend_hash_index_find(&ctx->ref_map, (zend_ulong)(uintptr_t)ref);
+		/* Check if we've seen this reference before — match the pre-hashed key
+		 * we used on insertion in dc_ref_add(). */
+		zval *existing = zend_hash_index_find(&ctx->ref_map, dc_ptr_hash(ref));
 		if (existing) {
 			/* Re-encounter: emit -refId, set mask=false */
 			uint32_t idx = (uint32_t)Z_LVAL_P(existing);
 			ctx->refs[idx].count++;
 			ZVAL_LONG(dst, -(zend_long)(idx + 1));
-			ZVAL_FALSE(mask_dst);
+			DC_MASK_HARD_REF(mask_dst);
 			return;
 		}
 
@@ -698,7 +765,7 @@ static void dc_copy_value(dc_ctx *ctx, zval *src, zval *dst, zval *mask_dst)
 			ctx->objects_count++;
 			dc_pool_entry *entry = (dc_pool_entry *)Z_PTR_P(pooled);
 			ZVAL_LONG(dst, entry->id);
-			ZVAL_TRUE(mask_dst);
+			DC_MASK_OBJ_REF(mask_dst);
 			goto handle_value;
 		}
 	}
@@ -760,7 +827,7 @@ static void dc_copy_value(dc_ctx *ctx, zval *src, zval *dst, zval *mask_dst)
 				zend_hash_index_add_new(Z_ARRVAL_P(dst), 2, &zmethod);
 			}
 
-			ZVAL_LONG(mask_dst, 0);
+			DC_MASK_NAMED_CLOSURE(mask_dst);
 			goto handle_value;
 		}
 		/* Anonymous closure — fall through to regular object handling */
@@ -783,9 +850,9 @@ handle_value:
 		ref_entry->tree_pos = dst;
 		zval_ptr_dtor(dst);
 		ZVAL_LONG(dst, -(zend_long)ref_entry->id);
-		/* Override mask to false (hard-ref marker) */
+		/* Override mask to the hard-ref marker */
 		zval_ptr_dtor(mask_dst);
-		ZVAL_FALSE(mask_dst);
+		DC_MASK_HARD_REF(mask_dst);
 		ref_entry->mask_slot = mask_dst;
 	}
 }
@@ -823,10 +890,11 @@ static void dc_process_object(dc_ctx *ctx, zval *src, zval *dst, zval *mask_dst)
 	entry->state_props = NULL;
 	entry->state_mask = NULL;
 
-	/* Register in id-indexed entries array */
+	/* Register in id-indexed entries array — 1.5× growth, safe_erealloc
+	 * for overflow detection (see the comment in dc_ref_add). */
 	if (entry->id >= ctx->entries_cap) {
-		ctx->entries_cap = ctx->entries_cap ? ctx->entries_cap * 2 : 8;
-		ctx->entries = erealloc(ctx->entries, ctx->entries_cap * sizeof(dc_pool_entry *));
+		ctx->entries_cap = ctx->entries_cap < 8 ? 8 : ((ctx->entries_cap * 3) >> 1) + 1;
+		ctx->entries = safe_erealloc(ctx->entries, ctx->entries_cap, sizeof(dc_pool_entry *), 0);
 	}
 	ctx->entries[entry->id] = entry;
 
@@ -1321,7 +1389,7 @@ prepare_props:
 replace_with_id:
 	/* Write the pool ID and the object marker into the caller's slots. */
 	ZVAL_LONG(dst, entry->id);
-	ZVAL_TRUE(mask_dst);
+	DC_MASK_OBJ_REF(mask_dst);
 }
 
 static int dc_compare_bucket_keys(Bucket *a, Bucket *b) {
@@ -1577,6 +1645,16 @@ PHP_FUNCTION(deepclone_to_array)
 		Z_PARAM_ZVAL(value)
 	ZEND_PARSE_PARAMETERS_END();
 
+	/* Reject resources at the top level just like the walker does mid-tree.
+	 * Without this, resource roots would hit the fast path below and get
+	 * returned wrapped in ['value' => $resource], which is no longer a pure
+	 * array and silently breaks downstream serializers. */
+	if (UNEXPECTED(Z_TYPE_P(value) == IS_RESOURCE)) {
+		zend_throw_exception_ex(dc_ce_not_instantiable_exception, 0,
+			"%s resource", zend_rsrc_list_get_rsrc_type(Z_RES_P(value)));
+		return;
+	}
+
 	/* Static values: return ['value' => $value] */
 	if (Z_TYPE_P(value) != IS_OBJECT && (Z_TYPE_P(value) != IS_ARRAY || zend_hash_num_elements(Z_ARRVAL_P(value)) == 0)) {
 		array_init(return_value);
@@ -1600,6 +1678,17 @@ PHP_FUNCTION(deepclone_to_array)
 
 	/* Top-level walk: top_mask receives the mask directly */
 	dc_copy_value(&ctx, value, &prepared, &top_mask);
+
+	/* Fast-path abort: if the walker hit the stack limit, a non-instantiable
+	 * class or a throwing __serialize, we have a partially-populated payload
+	 * that the post-processing passes below would happily walk anyway. Bail
+	 * out and let the caller see the exception as-is. */
+	if (UNEXPECTED(EG(exception))) {
+		zval_ptr_dtor(&prepared);
+		zval_ptr_dtor(&top_mask);
+		dc_ctx_destroy(&ctx);
+		return;
+	}
 
 	/* Post-process: unwrap unshared refs (count=0) */
 	for (uint32_t i = 0; i < ctx.refs_count; i++) {
@@ -1670,7 +1759,7 @@ PHP_FUNCTION(deepclone_to_array)
  */
 static void dc_resolve(zval *value, zval *mask, zval *objects, HashTable *refs, zval *retval)
 {
-	if (EXPECTED(Z_TYPE_P(mask) == IS_TRUE)) {
+	if (EXPECTED(DC_MASK_IS_OBJ_REF(mask))) {
 		if (UNEXPECTED(Z_TYPE_P(value) != IS_LONG)) {
 			zend_value_error("deepclone_from_array(): malformed payload, object reference value must be of type int, %s given", zend_zval_value_name(value));
 			return;
@@ -1694,7 +1783,7 @@ static void dc_resolve(zval *value, zval *mask, zval *objects, HashTable *refs, 
 		return;
 	}
 
-	if (Z_TYPE_P(mask) == IS_FALSE) {
+	if (DC_MASK_IS_HARD_REF(mask)) {
 		if (UNEXPECTED(Z_TYPE_P(value) != IS_LONG)) {
 			zend_value_error("deepclone_from_array(): malformed payload, hard-ref value must be of type int, %s given", zend_zval_value_name(value));
 			return;
@@ -1712,7 +1801,7 @@ static void dc_resolve(zval *value, zval *mask, zval *objects, HashTable *refs, 
 		return;
 	}
 
-	if (Z_TYPE_P(mask) == IS_LONG && Z_LVAL_P(mask) == 0) {
+	if (DC_MASK_IS_NAMED_CLOSURE(mask)) {
 		/* Named closure: value is [obj_or_class, method] or [[callable], class, method] */
 		if (Z_TYPE_P(value) != IS_ARRAY) {
 			zend_value_error("deepclone_from_array(): malformed payload, named-closure value must be of type array, %s given", zend_zval_value_name(value));
