@@ -108,10 +108,11 @@ foreach ($nonInstantiable as $label => $value) {
 //    rejected. Property restoration would silently produce a default-state
 //    clone — e.g. an SplFileInfo with no path, a ZipArchive with no archive,
 //    a PDO with no connection. We catch them up-front instead of returning
-//    a corrupt clone.
+//    a corrupt clone. Only test classes from required extensions to keep
+//    the suite portable; the same logic catches PDO, ZipArchive, mysqli_*,
+//    SplFileObject, etc. when those extensions are loaded.
 $hiddenState = [
     'SplFileInfo' => new SplFileInfo('/etc/hostname'),
-    'ZipArchive'  => new ZipArchive(),
 ];
 foreach ($hiddenState as $label => $value) {
     try {
@@ -157,7 +158,6 @@ echo "Done\n";
 3. RecursiveIteratorIterator: OK
 3. anonymous class: OK
 4. SplFileInfo: OK (SplFileInfo)
-4. ZipArchive: OK (ZipArchive)
 5. ArrayObject: OK
 5. SplFixedArray: OK
 5. SplObjectStorage: OK
