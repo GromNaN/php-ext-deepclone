@@ -19,7 +19,7 @@ try {
     ]);
     echo "1. FAIL: no exception\n";
 } catch (\InvalidArgumentException $e) {
-    $ok = $e instanceof \DeepClone\ClassNotFoundException && $e->getMessage() === 'NonExistentClassXyz';
+    $ok = $e instanceof \DeepClone\ClassNotFoundException && str_contains($e->getMessage(), 'NonExistentClassXyz');
     echo '1. ', $ok ? 'OK' : 'FAIL', ': ', $e::class, ' msg=', $e->getMessage(), "\n";
 }
 
@@ -175,7 +175,7 @@ try {
 echo "Done\n";
 ?>
 --EXPECT--
-1. OK: DeepClone\ClassNotFoundException msg=NonExistentClassXyz
+1. OK: DeepClone\ClassNotFoundException msg=Class "NonExistentClassXyz" not found.
 2a. SplObjectStorage shared key: OK
 2b. SplObjectStorage shared value: OK
 2c. ArrayObject shared item: OK
@@ -186,8 +186,8 @@ echo "Done\n";
 3. IteratorIterator: OK
 3. RecursiveIteratorIterator: OK
 3. anonymous class: OK
-4. SplFileInfo: OK (SplFileInfo)
-4b. SensitiveParameterValue: OK (SensitiveParameterValue)
+4. SplFileInfo: OK (Type "SplFileInfo" is not instantiable.)
+4b. SensitiveParameterValue: OK (Type "SensitiveParameterValue" is not instantiable.)
 5. ArrayObject: OK
 5. SplFixedArray: OK
 5. SplObjectStorage: OK

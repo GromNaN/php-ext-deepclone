@@ -750,7 +750,7 @@ static void dc_copy_value(dc_ctx *ctx, zval *src, zval *dst, zval *mask_dst)
 	/* ── Resource (cold — rejected to match PHP DeepCloner) ── */
 	if (UNEXPECTED(Z_TYPE_P(src) == IS_RESOURCE)) {
 		zend_throw_exception_ex(dc_ce_not_instantiable_exception, 0,
-			"%s resource", zend_rsrc_list_get_rsrc_type(Z_RES_P(src)));
+			"Type \"%s resource\" is not instantiable.", zend_rsrc_list_get_rsrc_type(Z_RES_P(src)));
 		return;
 	}
 
@@ -939,7 +939,7 @@ static void dc_process_object(dc_ctx *ctx, zval *src, zval *dst, zval *mask_dst)
 	/* ── Reject non-instantiable classes (Reflection*, *IteratorIterator) ── */
 	if (UNEXPECTED(ci & DC_CI_NOT_INSTANTIABLE)) {
 		zend_throw_exception_ex(dc_ce_not_instantiable_exception, 0,
-			"%s", ZSTR_VAL(ce->name));
+			"Type \"%s\" is not instantiable.", ZSTR_VAL(ce->name));
 		zval_ptr_dtor(&props_zval);
 		return;
 	}
@@ -2312,7 +2312,7 @@ PHP_FUNCTION(deepclone_from_array)
 				ce = zend_lookup_class(class_name);
 				if (!ce) {
 					zend_throw_exception_ex(dc_ce_class_not_found_exception, 0,
-						"%s", ZSTR_VAL(class_name));
+						"Class \"%s\" not found.", ZSTR_VAL(class_name));
 					goto cleanup;
 				}
 				zval zce;
