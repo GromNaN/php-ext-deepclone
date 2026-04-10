@@ -394,11 +394,29 @@ static uint8_t dc_get_class_info(dc_ctx *ctx, zend_class_entry *ce)
 		flags |= DC_CI_NOT_INSTANTIABLE;
 	}
 
-	/* Internal classes with C-level state (create_object != NULL) and no
-	 * declared serialization API are rejected. Classes that declare
-	 * __serialize/__unserialize/__sleep/__wakeup are trusted — they
-	 * round-trip via object_init_ex() + __unserialize(). */
+	/* Internal classes with C-level state (create_object != NULL):
+	 *   Rule A: final + no serialization API → probe instantiation; reject if it fails.
+	 *   Rule B: non-final + no serialization API → reject.
+	 * Classes declaring __serialize/__unserialize/__sleep/__wakeup are trusted:
+	 * they round-trip via object_init_ex() + __unserialize(), same as PHP's
+	 * own serialize/unserialize.
+	 * Rule A uses a probe instead of an unconditional reject because some final
+	 * internal classes are stateless and fully reconstructable from their PHP-
+	 * visible properties (e.g. MongoDB\BSON\MinKey / MaxKey): object_init_ex()
+	 * succeeds and produces a complete object with no hidden C-level state. */
 	if (ce->type == ZEND_INTERNAL_CLASS
+	 && ce->create_object != NULL
+	 && (ce->ce_flags & ZEND_ACC_FINAL)
+	 && !(flags & (DC_CI_HAS_SERIALIZE | DC_CI_HAS_UNSERIALIZE | DC_CI_HAS_SLEEP | DC_CI_HAS_WAKEUP))
+	 && ce != php_ce_incomplete_class) {
+		zval probe;
+		if (object_init_ex(&probe, ce) != SUCCESS || EG(exception)) {
+			zend_clear_exception();
+			flags |= DC_CI_NOT_INSTANTIABLE;
+		} else {
+			zval_ptr_dtor(&probe);
+		}
+	} else if (ce->type == ZEND_INTERNAL_CLASS
 	 && ce->create_object != NULL
 	 && ce->serialize == NULL
 	 && !(flags & (DC_CI_HAS_SERIALIZE | DC_CI_HAS_UNSERIALIZE | DC_CI_HAS_SLEEP | DC_CI_HAS_WAKEUP))
