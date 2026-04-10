@@ -385,61 +385,19 @@ static uint8_t dc_get_class_info(dc_ctx *ctx, zend_class_entry *ce)
 		flags |= DC_CI_NOT_INSTANTIABLE;
 	}
 
-	/* Honour ZEND_ACC_NOT_SERIALIZABLE — the canonical "this class refuses
-	 * to be serialized" signal in modern PHP (8.1+). Set on Closure, Generator,
-	 * Fiber, WeakMap, WeakReference, SensitiveParameterValue, every intl class,
-	 * and anything else that explicitly opts out. Replaces the legacy
-	 * `ce->serialize == zend_class_serialize_deny` mechanism, which was removed
-	 * in PHP 8.1 (php/php-src@322864b5694) and is gone from every PHP version
-	 * we support.
-	 *
-	 * Critical case: SensitiveParameterValue. The class deliberately hides its
-	 * $value field from (array) cast via a custom cast_object handler (so that
-	 * a misconfigured logger can't print secrets), so the property pipeline
-	 * sees nothing. Without this check the C extension would silently round-
-	 * trip a SensitiveParameterValue to a default-state instance — losing the
-	 * secret data.
-	 *
-	 * Same escape hatches as the existing anon-class / Reflection check below:
-	 * if a class declares its own (un)serialization API (Serializable interface,
-	 * __unserialize, __wakeup), trust the declaration. PHP itself stamps every
-	 * anonymous class with NOT_SERIALIZABLE (Zend/zend_compile.c) but Symfony
-	 * lets anonymous classes round-trip when they implement the magic methods,
-	 * so we have to honour the same exemption. */
+	/* Honour ZEND_ACC_NOT_SERIALIZABLE — classes that explicitly refuse
+	 * serialization. Escape hatch: if the class declares its own
+	 * (un)serialization API, trust the declaration. */
 	if ((ce->ce_flags & ZEND_ACC_NOT_SERIALIZABLE)
 	 && !(flags & (DC_CI_HAS_UNSERIALIZE | DC_CI_HAS_WAKEUP))
 	 && ce->serialize == NULL) {
 		flags |= DC_CI_NOT_INSTANTIABLE;
 	}
 
-	/* Two complementary rules for internal classes with hidden non-property
-	 * state, both keyed on `ce->create_object != NULL` (the canonical signal
-	 * that the class allocates its own zend_object subclass with extra C-level
-	 * fields beyond the standard property table).
-	 *
-	 * Rule A — internal final + create_object:
-	 * Mirrors Reflection's "internal class marked as final cannot be
-	 * instantiated without invoking its constructor" rule (see
-	 * ext/reflection/php_reflection.c). Any class that matches this rule
-	 * can't be reconstructed by Symfony's machinery regardless of whether
-	 * it declares __serialize / __unserialize, because the wider Symfony
-	 * pipeline relies on newInstanceWithoutConstructor() to build prototypes.
-	 * No magic-method escape hatch applies.
-	 * Hits: Closure, Generator, Fiber, HashContext, WeakMap, WeakReference.
-	 *
-	 * Rule B — internal non-final + create_object + no declared serialization API:
-	 * Catches non-final internal classes that hold native state outside the
-	 * property table (file handles, database connections, libzip pointers, …)
-	 * and never bothered to declare a serialization API. Property restoration
-	 * would silently produce a default-state instance. Magic-method escape
-	 * hatches apply because a class that declares __serialize/__unserialize
-	 * is asserting it can round-trip.
-	 * Hits: SplFileInfo, SplFileObject, PDO, ZipArchive, mysqli_*, …
-	 * Doesn't hit (correctly): ArrayObject, SplFixedArray, SplDoublyLinkedList,
-	 * SplObjectStorage, DateTime*, DateInterval — they all declare
-	 * __serialize/__unserialize.
-	 *
-	 * Rule A is checked first (no escape hatch), then Rule B as a fallback. */
+	/* Internal classes with C-level state (create_object != NULL):
+	 *   Rule A: final + create_object → always reject (no escape hatch).
+	 *   Rule B: non-final + create_object + no serialization API → reject.
+	 * Classes with __serialize/__unserialize/__sleep/__wakeup are trusted. */
 	if (ce->type == ZEND_INTERNAL_CLASS
 	 && ce->create_object != NULL
 	 && (ce->ce_flags & ZEND_ACC_FINAL)
