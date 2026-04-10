@@ -2,12 +2,7 @@
 deepclone_to_array() / deepclone_from_array() round-trip MongoDB BSON types
 --EXTENSIONS--
 deepclone
---SKIPIF--
-<?php
-if (!extension_loaded('mongodb')) {
-    echo "skip mongodb extension not available\n";
-}
-?>
+mongodb
 --FILE--
 <?php
 
@@ -45,6 +40,8 @@ $clone = deepclone_from_array(deepclone_to_array($obj));
 var_dump($clone->a == $clone->b);    // same value
 var_dump($clone->a === $clone->b);   // object identity preserved in the graph
 var_dump($clone->a !== $oid);        // but distinct from the original
+
+echo "Done\n";
 ?>
 --EXPECT--
 bool(true)
@@ -63,3 +60,4 @@ bool(true)
 bool(true)
 bool(true)
 bool(true)
+Done
