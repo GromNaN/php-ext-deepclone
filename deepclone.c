@@ -2079,6 +2079,7 @@ PHP_FUNCTION(deepclone_from_array)
 {
 	HashTable *data_ht;
 	HashTable *allowed_ht = NULL;
+	HashTable *allowed_set = NULL;
 	HashTable class_list;
 	HashTable ce_cache;
 	HashTable refs;
@@ -2154,25 +2155,19 @@ PHP_FUNCTION(deepclone_from_array)
 
 	/* ── Validate allowed classes ──────────────── */
 	if (allowed_ht) {
-		HashTable *allowed_set = dc_build_allowed_set(allowed_ht, "deepclone_from_array");
+		allowed_set = dc_build_allowed_set(allowed_ht, "deepclone_from_array");
 		if (!allowed_set) {
 			goto cleanup;
 		}
 
-		/* Check every class in the payload against the set. */
 		for (uint32_t i = 0; i < num_classes; i++) {
 			zval *cls = zend_hash_index_find(&class_list, i);
 			if (!dc_class_allowed(allowed_set, Z_STR_P(cls))) {
-				zend_hash_destroy(allowed_set);
-				efree(allowed_set);
 				DC_INVALID("deepclone_from_array(): class \"%s\" is not allowed", ZSTR_VAL(Z_STR_P(cls)));
 			}
 		}
 
-		/* Check for named closures if Closure is not allowed. */
 		bool closure_allowed = dc_class_allowed(allowed_set, zend_ce_closure->name);
-		zend_hash_destroy(allowed_set);
-		efree(allowed_set);
 
 		if (!closure_allowed) {
 			/* Scan mask, resolve, refMasks, and state masks for the
@@ -2292,10 +2287,12 @@ PHP_FUNCTION(deepclone_from_array)
 		zend_string *class_name = obj_classes[id];
 		zval obj_zval;
 
-		/* Serialized object (class[1] == ':') */
 		if (ZSTR_LEN(class_name) > 1 && ZSTR_VAL(class_name)[1] == ':') {
 			php_unserialize_data_t var_hash;
 			PHP_VAR_UNSERIALIZE_INIT(var_hash);
+			if (allowed_set) {
+				php_var_unserialize_set_allowed_classes(var_hash, allowed_set);
+			}
 			const unsigned char *p = (const unsigned char *)ZSTR_VAL(class_name);
 			const unsigned char *end = p + ZSTR_LEN(class_name);
 			if (!php_var_unserialize(&obj_zval, &p, end, &var_hash)) {
@@ -2550,6 +2547,7 @@ PHP_FUNCTION(deepclone_from_array)
 	}
 
 cleanup:
+	if (allowed_set) { zend_hash_destroy(allowed_set); efree(allowed_set); }
 	if (ce_cache_inited) zend_hash_destroy(&ce_cache);
 	if (refs_inited)     zend_hash_destroy(&refs);
 	if (objects_inited)  zval_ptr_dtor(&objects);

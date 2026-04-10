@@ -3,69 +3,94 @@
 [![CI](https://github.com/symfony/php-ext-deepclone/actions/workflows/test.yml/badge.svg)](https://github.com/symfony/php-ext-deepclone/actions/workflows/test.yml)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-**Export any serializable PHP value as a pure array — and rebuild it back into
-the original object graph.** Also doubles as a native accelerator for Symfony's
-[`VarExporter\DeepCloner`](https://symfony.com/doc/current/components/var_exporter.html).
+A PHP extension that deep-clones any serializable PHP value while preserving
+copy-on-write for strings and arrays — resulting in lower memory usage and
+better performance than `unserialize(serialize())`.
 
-## What it does
+It works by converting the value graph to a pure-array representation (only
+scalars and nested arrays, no objects) and back. This array form is the wire
+format used by Symfony's
+[`VarExporter\DeepCloner`](https://symfony.com/doc/current/components/var_exporter.html),
+making the extension a transparent drop-in accelerator.
 
-The extension exposes two functions:
+## Use cases
+
+**Repeated cloning of a prototype.** Calling `unserialize(serialize())` in a
+loop allocates fresh copies of every string and array, blowing up memory.
+This extension preserves PHP's copy-on-write: strings and scalar arrays are
+shared between clones until they are actually modified.
 
 ```php
-function deepclone_to_array(mixed $value): array;
-function deepclone_from_array(array $data): mixed;
+$cloner = new DeepCloner($prototype);
+for ($i = 0; $i < 1000; $i++) {
+    $clone = $cloner->clone();  // fast, COW-friendly
+}
 ```
 
-`deepclone_to_array()` walks any PHP value graph — objects, arrays, references,
-closures, enums, internal types — and returns a payload that contains **only
-scalars and nested arrays**: no objects, no resources, no surprises. Pass that
-payload to anything that handles plain PHP arrays — `json_encode()`,
-`var_export()`, APCu, igbinary, MessagePack, an HTTP body, a cache backend.
+**OPcache-friendly cache format.** `DeepCloner::toArray()` produces a plain
+PHP array suitable for `var_export()`. When cached in a `.php` file, OPcache
+maps it into shared memory — making the "unserialize" step essentially free:
 
-`deepclone_from_array()` does the reverse: feed it the payload and it rebuilds
-the original graph, preserving object identity, internal references, private
-properties, `__wakeup` / `__unserialize` semantics, and so on.
+```php
+// Write:
+file_put_contents('cache.php', '<?php return ' . VarExporter::export($cloner->toArray()) . ';');
 
-The wire format is the one used by Symfony's
-`VarExporter\DeepCloner::toArray()` / `::fromArray()`. The two implementations
-produce identical payloads, so you can produce on one side and consume on the
-other.
+// Read (OPcache serves this from SHM):
+$cloner = DeepCloner::fromArray(require 'cache.php');
+$value  = $cloner->clone();
+```
 
-## Why
+**Serialization to any format.** The array form can be passed to
+`json_encode()`, MessagePack, igbinary, APCu, or any transport that handles
+plain PHP arrays — without losing object identity, cycles, references, or
+private property state.
 
-- **A pure-array form for any value**, even ones that can't normally be JSON-encoded
-  (objects with private state, cycles, references, closures over named methods, …).
-  Once a graph is in array form it can travel through any serializer or cache
-  layer that doesn't speak PHP objects.
-- **Identity & reference preservation**: shared subgraphs stay shared, hard
-  references stay live, cycles round-trip cleanly. Unlike `json_encode()` or
-  `var_export()`, no information is lost on the way out.
-- **4–5× faster** than the pure-PHP `DeepCloner` implementation on `toArray()`
-  and end-to-end `deepClone()`.
-- **On par with `unserialize(serialize($value))`**, while preserving
-  copy-on-write for strings and scalar arrays — so memory usage stays low when
-  the input is mostly immutable.
+## API
+
+```php
+function deepclone_to_array(mixed $value, ?array $allowedClasses = null): array;
+function deepclone_from_array(array $data, ?array $allowedClasses = null): mixed;
+```
+
+`$allowedClasses` restricts which classes may be serialized or deserialized
+(`null` = allow all, `[]` = allow none). Case-insensitive, matching
+`unserialize()`'s `allowed_classes` option. Closures require `"Closure"` in
+the list.
+
+## What it preserves
+
+- Object identity (shared references stay shared)
+- PHP `&` hard references
+- Cycles in the object graph
+- Private/protected properties across inheritance
+- `__serialize` / `__unserialize` / `__sleep` / `__wakeup` semantics
+- Named closures (first-class callables like `strlen(...)`)
+- Enum values
+- Copy-on-write for strings and scalar arrays
+
+## Error handling
+
+| Exception                            | Thrown by             | When                                                     |
+| ------------------------------------ | --------------------- | -------------------------------------------------------- |
+| `DeepClone\NotInstantiableException` | `deepclone_to_array`  | Resource, anonymous class, `Reflection*`, internal class without serialization support |
+| `DeepClone\ClassNotFoundException`   | `deepclone_from_array`| Payload references a class that doesn't exist            |
+| `ValueError`                         | both                  | Malformed input, or class not in `$allowedClasses`       |
+
+Both exception classes extend `\InvalidArgumentException`.
 
 ## Requirements
 
-- PHP **8.2** or later (NTS or ZTS, 64-bit and 32-bit)
-- `ext-reflection` and `ext-spl` (always present in stock PHP builds)
+- PHP 8.2+ (NTS or ZTS, 64-bit and 32-bit)
 
 ## Installation
 
 ### With PIE (recommended)
 
-[PIE](https://github.com/php/pie) is the modern installer for PHP extensions:
-
 ```bash
 pie install symfony/deepclone
 ```
 
-On Linux and macOS, PIE compiles from source. On Windows, PIE downloads
-the prebuilt DLL matching your PHP version, architecture, and TS/NTS flavor
-from the GitHub release — no MSVC or PHP SDK required.
-
-Then enable the extension in your `php.ini`:
+Then enable in `php.ini`:
 
 ```ini
 extension=deepclone
@@ -76,75 +101,23 @@ extension=deepclone
 ```bash
 git clone https://github.com/symfony/php-ext-deepclone.git
 cd php-ext-deepclone
-phpize
-./configure --enable-deepclone
-make
-make test
+phpize && ./configure --enable-deepclone && make && make test
 sudo make install
 ```
 
-Then enable in `php.ini` as above.
+## With Symfony
 
-## Usage
-
-### Standalone
-
-```php
-$graph = new MyComplexObject(/* ... */);
-
-$payload = deepclone_to_array($graph);   // pure array
-$copy    = deepclone_from_array($payload); // fresh deep copy
-```
-
-### Through Symfony's `DeepCloner`
-
-If you have `symfony/var-exporter` installed, just load the extension — Symfony's
-`DeepCloner` automatically picks it up at file-load time. No code change needed:
+If `symfony/var-exporter` is installed, `DeepCloner` picks up the extension
+automatically — no code change needed:
 
 ```php
 use Symfony\Component\VarExporter\DeepCloner;
 
-$copy = DeepCloner::deepClone($graph); // 4–5× faster with the extension loaded
+$clone = DeepCloner::deepClone($graph);  // 4-5× faster with the extension
 ```
 
-## Error handling
-
-Both functions throw a typed exception under the `DeepClone\` namespace when
-the input cannot be processed. Both exception classes extend
-`\InvalidArgumentException`, so existing `catch (\InvalidArgumentException $e)`
-blocks pick them up. The exception message is the bare class or type name.
-
-| Class                                | Thrown by                | Meaning                                                          |
-| ------------------------------------ | ------------------------ | ---------------------------------------------------------------- |
-| `DeepClone\NotInstantiableException` | `deepclone_to_array()`   | Resource, anonymous class, `Reflection*`, `*IteratorIterator`, … |
-| `DeepClone\ClassNotFoundException`   | `deepclone_from_array()` | Payload references a class that no longer exists                 |
-
-`deepclone_from_array()` additionally throws `\ValueError` on malformed input.
-
-```php
-try {
-    $payload = deepclone_to_array($graph);
-} catch (\DeepClone\NotInstantiableException $e) {
-    // $e->getMessage() === "ReflectionClass" (or "stream resource", …)
-}
-```
-
-## Compatibility & stability
-
-- **PHP versions**: 8.2, 8.3, 8.4, 8.5 — tested on each in CI.
-- **Builds**: NTS and ZTS, on Linux, macOS, and Windows.
-- **Wire format**: stable across patch releases. Any change to the wire format
-  in a way that would break interoperability with the PHP `DeepCloner` will be
-  a minor (`0.x`) bump pre-1.0 and a major bump post-1.0.
-
-## Relationship with Symfony's `VarExporter`
-
-This extension is a drop-in C accelerator for the PHP code at
-[`Symfony\Component\VarExporter\DeepCloner`](https://github.com/symfony/symfony/tree/7.x/src/Symfony/Component/VarExporter).
-It does **not** replace the component — Symfony's pure-PHP path remains the
-reference implementation, the source of truth for the wire format, and the
-fallback when the extension is not loaded. Loading the extension is purely
-opt-in and transparent.
+Without the extension, `DeepCloner` falls back to the pure-PHP polyfill
+(`symfony/polyfill-deepclone`), which produces the same wire format.
 
 ## License
 
