@@ -12,7 +12,7 @@ deepclone
  */
 
 function fuzz_value(int &$seed, int $depth = 0): mixed {
-    $seed = ($seed * 1103515245 + 12345) & 0x7FFFFFFF;
+    $seed = (int) fmod($seed * 1103515245 + 12345, 2147483648);
     $type = $seed % 8;
 
     if ($depth > 6) {
@@ -38,7 +38,7 @@ function fuzz_value(int &$seed, int $depth = 0): mixed {
 }
 
 function fuzz_array(int &$seed, int $depth): array {
-    $seed = ($seed * 1103515245 + 12345) & 0x7FFFFFFF;
+    $seed = (int) fmod($seed * 1103515245 + 12345, 2147483648);
     $n = $seed % 8;
     $arr = [];
     for ($i = 0; $i < $n; $i++) {
@@ -48,7 +48,7 @@ function fuzz_array(int &$seed, int $depth): array {
 }
 
 function fuzz_object(int &$seed, int $depth): stdClass {
-    $seed = ($seed * 1103515245 + 12345) & 0x7FFFFFFF;
+    $seed = (int) fmod($seed * 1103515245 + 12345, 2147483648);
     $n = ($seed % 5) + 1;
     $o = new stdClass();
     for ($i = 0; $i < $n; $i++) {
@@ -59,7 +59,7 @@ function fuzz_object(int &$seed, int $depth): stdClass {
 }
 
 function fuzz_object_graph(int &$seed, int $depth): mixed {
-    $seed = ($seed * 1103515245 + 12345) & 0x7FFFFFFF;
+    $seed = (int) fmod($seed * 1103515245 + 12345, 2147483648);
     $n = ($seed % 4) + 2;
     $objects = [];
     for ($i = 0; $i < $n; $i++) {
@@ -68,7 +68,7 @@ function fuzz_object_graph(int &$seed, int $depth): mixed {
     }
     // Random links
     for ($i = 0; $i < $n; $i++) {
-        $seed = ($seed * 1103515245 + 12345) & 0x7FFFFFFF;
+        $seed = (int) fmod($seed * 1103515245 + 12345, 2147483648);
         $target = $seed % $n;
         $objects[$i]->link = $objects[$target];
         $objects[$i]->val = fuzz_value($seed, $depth + 1);

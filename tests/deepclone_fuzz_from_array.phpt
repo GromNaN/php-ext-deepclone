@@ -11,7 +11,7 @@ deepclone
  */
 
 function fuzz_payload(int &$seed): array {
-    $seed = ($seed * 1103515245 + 12345) & 0x7FFFFFFF;
+    $seed = (int) fmod($seed * 1103515245 + 12345, 2147483648);
     $type = $seed % 6;
 
     return match ($type) {
