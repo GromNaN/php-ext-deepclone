@@ -26,14 +26,7 @@
 #include "Zend/zend_closures.h"
 #include "Zend/zend_exceptions.h"
 
-/* Stack-limit protection ships only from PHP 8.4. The helper symbol
- * zend_call_stack_size_error() landed in 8.3 as a file-local `static`
- * function and was promoted to an exported ZEND_API symbol only in
- * php-src@443aa29dbe2 (Sept 2024 → PHP 8.4) when the declaration was
- * added to Zend/zend_execute.h for phpdbg support. On 8.2 and 8.3 the
- * extension can't call it, so dc_check_stack_limit() is a no-op there
- * and those versions still segfault on pathological depth — same as
- * any other pre-8.4 extension that didn't bother. */
+/* Stack-limit protection requires PHP 8.4+; no-op on older versions. */
 #if PHP_VERSION_ID >= 80400
 # include "Zend/zend_call_stack.h"
 #endif
@@ -193,8 +186,6 @@ typedef struct {
 	int            wakeup;        /* >0 = __wakeup order, <0 = __unserialize order, 0 = none */
 	HashTable     *props;         /* [scope][name] => value (already prepared) */
 	HashTable     *prop_mask;     /* [scope][name] => mask marker (or NULL) */
-	HashTable     *state_props;   /* for __unserialize: prepared props */
-	HashTable     *state_mask;    /* for __unserialize: mask */
 } dc_pool_entry;
 
 /* ── Traversal context ──────────────────────────────────────── */
@@ -550,6 +541,9 @@ static bool dc_array_is_static(HashTable *ht)
 	if (UNEXPECTED(GC_FLAGS(ht) & GC_IMMUTABLE)) {
 		return true;
 	}
+	if (UNEXPECTED(dc_check_stack_limit())) {
+		return false;
+	}
 	zval *val;
 	ZEND_HASH_FOREACH_VAL(ht, val) {
 		if (UNEXPECTED(Z_ISREF_P(val))) {
@@ -620,23 +614,8 @@ static zend_always_inline bool dc_class_allowed(HashTable *set, zend_string *nam
 
 /* ── Core traversal ─────────────────────────────────────────── */
 
-/*
- * dc_copy_value: process a single value, writing the result to *dst and the
- * mask marker (if any) to *mask_dst.
- *
- * - src is read-only — never mutated, never freed by us.
- * - dst starts UNDEF; we write the final prepared value into it.
- * - mask_dst starts UNDEF; if the value needs a marker, we write it there.
- *   If no marker is needed, the slot stays UNDEF and the caller skips it.
- *
- * Mask markers — use the DC_MASK_* macros below to set them so readers
- * can grep for the intent rather than decoding raw zval types:
- *   TRUE   = object reference        (dst is the object pool ID)
- *   FALSE  = hard PHP &-reference    (dst is the negative ref ID)
- *   LONG 0 = named closure           (dst is the encoded callable array)
- *   'e'    = UnitEnum                (dst is "Class::Case")
- *   ARRAY  = nested mask for sub-arrays
- */
+/* Mask markers: TRUE=obj_ref, FALSE=hard_ref, LONG(0)=named_closure,
+ * STRING("e")=enum, ARRAY=nested sub-mask. */
 #define DC_MASK_OBJ_REF(m)        ZVAL_TRUE(m)
 #define DC_MASK_HARD_REF(m)       ZVAL_FALSE(m)
 #define DC_MASK_NAMED_CLOSURE(m)  ZVAL_LONG((m), 0)
@@ -657,33 +636,14 @@ static void dc_copy_array(dc_ctx *ctx, HashTable *src_ht, zval *dst, zval *mask_
 	uint32_t n = zend_hash_num_elements(src_ht);
 
 	array_init_size(dst, n);
-	/* Pre-allocate the mask array with the same size and seed every slot with
-	 * NULL. We need stable pointers into the mask buckets so refs can write
-	 * to them after their parent has finished walking; using IS_NULL (rather
-	 * than IS_UNDEF) means dc_mask_cleanup() can iterate the placeholders via
-	 * the standard foreach macros — IS_UNDEF buckets look like tombstones to
-	 * PHP's HT and get skipped by ZEND_HASH_FOREACH/zend_hash_apply. */
+	/* Seed mask slots with IS_NULL (not IS_UNDEF — HT iteration skips those). */
 	array_init_size(mask_dst, n);
 
-	/* Fast path: dense packed source array. Use ZEND_HASH_FILL_PACKED to
-	 * bulk-fill dst with UNDEFs and mask with NULLs in two tight passes,
-	 * then walk src with the packed-only iterator (no indirect/key-extraction
-	 * branch per element) and advance direct pointers into dst->arPacked /
-	 * mask->arPacked in lockstep. This bypasses the per-element
-	 * zend_hash_add_new function call the generic path makes.
-	 *
-	 * Requires `HT_IS_WITHOUT_HOLES`: if src has IS_UNDEF tombstones,
-	 * ZEND_HASH_PACKED_FOREACH_VAL skips them, which would break the
-	 * lockstep slot advance. Sparse-packed arrays are rare in practice
-	 * (user data graphs don't usually unset elements) and fall through
-	 * to the generic loop below. */
+	/* Fast path: packed source without holes → lockstep arPacked walk. */
 	if (EXPECTED(HT_IS_PACKED(src_ht) && HT_IS_WITHOUT_HOLES(src_ht))) {
 		HashTable *dst_ht = Z_ARRVAL_P(dst);
 		HashTable *mask_ht = Z_ARRVAL_P(mask_dst);
 
-		/* array_init_size only reserves nTableSize; the underlying storage
-		 * isn't allocated until the first real insert. Force packed init so
-		 * arPacked is valid before FILL_PACKED writes to it. */
 		zend_hash_real_init_packed(dst_ht);
 		zend_hash_real_init_packed(mask_ht);
 
@@ -705,6 +665,7 @@ static void dc_copy_array(dc_ctx *ctx, HashTable *src_ht, zval *dst, zval *mask_
 		zval *mask_slot = mask_ht->arPacked;
 		ZEND_HASH_PACKED_FOREACH_VAL(src_ht, src_val) {
 			dc_copy_value(ctx, src_val, dst_slot, mask_slot);
+			if (UNEXPECTED(EG(exception))) return;
 			dst_slot++;
 			mask_slot++;
 		} ZEND_HASH_FOREACH_END();
@@ -712,8 +673,6 @@ static void dc_copy_array(dc_ctx *ctx, HashTable *src_ht, zval *dst, zval *mask_
 		return;
 	}
 
-	/* Generic path: hashed sources (string keys or sparse int keys) and
-	 * the sparse-packed-with-holes case. */
 	ZEND_HASH_FOREACH_KEY_VAL(src_ht, idx, key, src_val) {
 		zval undef, null_marker;
 		ZVAL_UNDEF(&undef);
@@ -727,10 +686,8 @@ static void dc_copy_array(dc_ctx *ctx, HashTable *src_ht, zval *dst, zval *mask_
 			new_mask_slot = zend_hash_index_add_new(Z_ARRVAL_P(mask_dst), idx, &null_marker);
 		}
 		dc_copy_value(ctx, src_val, new_dst_slot, new_mask_slot);
+		if (UNEXPECTED(EG(exception))) return;
 	} ZEND_HASH_FOREACH_END();
-
-	/* Slots that received no marker are still IS_NULL; dc_mask_cleanup()
-	 * runs after the unshared-ref unwrap pass and removes them. */
 }
 
 static void dc_mask_cleanup(zval *mask);
@@ -990,8 +947,6 @@ static void dc_process_object(dc_ctx *ctx, zval *src, zval *dst, zval *mask_dst)
 	entry->wakeup = 0;
 	entry->props = NULL;
 	entry->prop_mask = NULL;
-	entry->state_props = NULL;
-	entry->state_mask = NULL;
 
 	/* Register in id-indexed entries array — 1.5× growth, safe_erealloc
 	 * for overflow detection (see the comment in dc_ref_add). */
@@ -1451,6 +1406,12 @@ prepare_props:
 				zval mask_slot_zv;
 				ZVAL_UNDEF(&mask_slot_zv);
 				dc_copy_value(ctx, raw_val, &temp_dst, &mask_slot_zv);
+				if (UNEXPECTED(EG(exception))) {
+					zval_ptr_dtor(&temp_dst);
+					zval_ptr_dtor(&mask_slot_zv);
+					zval_ptr_dtor(&props_zval);
+					return;
+				}
 				dc_mask_cleanup(&mask_slot_zv);
 
 				out_scope = zend_hash_find(Z_ARRVAL(ctx->properties), scope);
@@ -1991,9 +1952,6 @@ static void dc_resolve(zval *value, zval *mask, zval *objects, HashTable *refs, 
 		}
 
 		if (is_private) {
-			/* Private method: create the closure directly from the function table.
-			 * Use zend_create_fake_closure() so the result carries the FAKE_CLOSURE
-			 * flag and dumps as "Class::method() { ... }" instead of "Closure() { ... }". */
 			zend_class_entry *ce = zend_lookup_class(priv_class);
 			if (ce) {
 				zend_string *lcmethod = zend_string_tolower(priv_method);
@@ -2005,24 +1963,20 @@ static void dc_resolve(zval *value, zval *mask, zval *objects, HashTable *refs, 
 				}
 			}
 		} else {
-			/* Lookup method/function by name (function tables use lowercase keys) */
 			zend_string *lcname = zend_string_tolower(Z_STR_P(zname));
 
 			if (Z_TYPE(resolved_obj) == IS_NULL) {
-				/* Global function: name(...) */
 				zend_function *func = zend_hash_find_ptr(CG(function_table), lcname);
 				if (func) {
 					zend_create_fake_closure(retval, func, NULL, NULL, NULL);
 				}
 			} else if (Z_TYPE(resolved_obj) == IS_OBJECT) {
-				/* Instance method: $obj->name(...) */
 				zend_class_entry *ce = Z_OBJCE(resolved_obj);
 				zend_function *func = zend_hash_find_ptr(&ce->function_table, lcname);
 				if (func) {
 					zend_create_fake_closure(retval, func, ce, ce, &resolved_obj);
 				}
 			} else if (Z_TYPE(resolved_obj) == IS_STRING) {
-				/* Static method: Class::name(...) */
 				zend_class_entry *ce = zend_lookup_class(Z_STR(resolved_obj));
 				if (ce) {
 					zend_function *func = zend_hash_find_ptr(&ce->function_table, lcname);
@@ -2032,6 +1986,11 @@ static void dc_resolve(zval *value, zval *mask, zval *objects, HashTable *refs, 
 				}
 			}
 			zend_string_release(lcname);
+		}
+		if (Z_ISUNDEF_P(retval)) {
+			zval_ptr_dtor(&resolved_obj);
+			zend_value_error("deepclone_from_array(): malformed payload, named-closure function or method not found");
+			return;
 		}
 		zval_ptr_dtor(&resolved_obj);
 		return;
@@ -2381,7 +2340,10 @@ PHP_FUNCTION(deepclone_from_array)
 			PHP_VAR_UNSERIALIZE_INIT(var_hash);
 			const unsigned char *p = (const unsigned char *)ZSTR_VAL(class_name);
 			const unsigned char *end = p + ZSTR_LEN(class_name);
-			php_var_unserialize(&obj_zval, &p, end, &var_hash);
+			if (!php_var_unserialize(&obj_zval, &p, end, &var_hash)) {
+				PHP_VAR_UNSERIALIZE_DESTROY(var_hash);
+				DC_INVALID("deepclone_from_array(): Argument #1 ($data) failed to unserialize object %u", id);
+			}
 			PHP_VAR_UNSERIALIZE_DESTROY(var_hash);
 		} else {
 			zval *cached_ce = zend_hash_find(&ce_cache, class_name);
@@ -2399,7 +2361,9 @@ PHP_FUNCTION(deepclone_from_array)
 				ZVAL_PTR(&zce, ce);
 				zend_hash_add_new(&ce_cache, class_name, &zce);
 			}
-			object_init_ex(&obj_zval, ce);
+			if (UNEXPECTED(object_init_ex(&obj_zval, ce) != SUCCESS)) {
+				goto cleanup;
+			}
 		}
 
 		zend_hash_index_add_new(Z_ARRVAL(objects), id, &obj_zval);
