@@ -128,25 +128,10 @@ static zend_always_inline bool dc_check_stack_limit(void)
 	return false;
 }
 
-/* We key ctx->ref_map on zend_reference pointers. zend_hash doesn't re-hash
- * numeric keys — it just masks them down to the bucket-count bits — so in
- * theory aligned pointers all map to the same bucket, which would hurt
- * lookup performance on pathological graphs. In practice:
- *
- *   - Splitmix64-mixing the pointer (ext/opcache's zend_jit_hash pattern)
- *     changes the distribution, but zend_hash relies on the input being
- *     the *identity* of the entry inside a bucket — it compares stored
- *     p->h against the input h on lookup, so any pre-hashing that isn't
- *     a pure permutation risks subtle bugs during rehash/resize. Review
- *     feedback (from a Zend internals maintainer) advises against
- *     pre-hashing keys handed to zend_hash at all.
- *
- *   - Empirically, the raw-pointer path never produced measurable
- *     slowdowns in the benchmark harness, and the ref_map is sparse
- *     anyway (refs are rare in real graphs).
- *
- * So we key on the raw pointer value. zend_hash's default bucket
- * distribution is good enough. */
+/* We key ctx->ref_map on raw zend_reference pointers. Pre-hashing is
+ * unsafe because zend_hash uses the stored key as a bucket-chain identity
+ * (p->h == h), not just for distribution. The ref_map is sparse enough
+ * that aligned-pointer collisions don't cause measurable slowdowns. */
 
 /* ── Permanent interned strings for output keys ───────────── */
 
@@ -769,10 +754,8 @@ static void dc_copy_value(dc_ctx *ctx, zval *src, zval *dst, zval *mask_dst)
 			return;
 		}
 
-		/* First encounter: register, then process the inner value. We
-		 * remember the *index* (not the pointer) into ctx->refs because
-		 * the recursive walk below may grow ctx->refs and invalidate any
-		 * pointer we'd cache here. */
+		/* First encounter: register, then process the inner value.
+		 * Store the index — the recursive walk may realloc ctx->refs. */
 		dc_ref_add(ctx, ref, inner, inner);
 		ref_idx = ctx->refs_count - 1;
 		src = inner;
@@ -899,11 +882,9 @@ static void dc_copy_value(dc_ctx *ctx, zval *src, zval *dst, zval *mask_dst)
 
 handle_value:
 	if (is_ref) {
-		/* Save the processed value and its mask, then replace dst with -refId.
-		 * IS_NULL/IS_UNDEF both mean "no real marker" (NULL is the placeholder
-		 * dc_copy_array seeds; UNDEF is the initial state at the top level).
-		 * Re-resolve ref_entry from the saved index — ctx->refs may have been
-		 * realloc'd by the recursive walk above. */
+		/* Save the processed value and its mask, then replace dst with
+		 * -refId. Re-resolve from the saved index (ctx->refs may have
+		 * been realloc'd by the recursive walk above). */
 		dc_ref_entry *ref_entry = &ctx->refs[ref_idx];
 		zval_ptr_dtor(&ref_entry->cur_value);
 		ZVAL_COPY(&ref_entry->cur_value, dst);
@@ -1357,16 +1338,14 @@ prepare_props:
 	entry->cidx = dc_class_index(ctx, entry->class_name);
 
 	if (has_unserialize) {
-		/* For __unserialize objects: prepare a flat array as the state argument.
-		 * No dc_mask_cleanup() pass — the bit-packed converter (dc_pack_value)
-		 * handles dense IS_NULL placeholders directly and rewinds nested slots
-		 * that didn't see any markers. */
+		/* For __unserialize objects: prepare a flat array as the state argument */
 		zval prepared_zval, prop_mask;
 		ZVAL_UNDEF(&prepared_zval);
 		ZVAL_UNDEF(&prop_mask);
 		dc_copy_array(ctx, Z_ARRVAL(props_zval), &prepared_zval, &prop_mask);
 		zval_ptr_dtor(&props_zval);
 		ZVAL_COPY_VALUE(&props_zval, &prepared_zval);
+		dc_mask_cleanup(&prop_mask);
 
 		entry->props = Z_ARRVAL(props_zval);
 		entry->prop_mask = (Z_TYPE(prop_mask) == IS_ARRAY) ? Z_ARRVAL(prop_mask) : NULL;
@@ -1374,19 +1353,10 @@ prepare_props:
 		/* For normal objects: transpose directly into ctx->properties[scope][name][id]
 		 * and ctx->resolve[scope][name][id] during the walk.
 		 *
-		 * IMPORTANT: dc_copy_value() recurses into child objects whose own
-		 * transpose loops may add entries to the very same
-		 * properties[scope][name] hash this frame just inserted into. Any such
-		 * insert can grow the bucket array and free the old one, invalidating
-		 * pointers we held into it. We therefore:
-		 *   - never cache `out_scope`/`out_name`/`out_rscope` pointers across
-		 *     the recursive call,
-		 *   - recurse into a stack-local temp zval (instead of directly into
-		 *     the bucket), and
-		 *   - re-find the destination slot by (scope, name, entry_id) after
-		 *     the recursion returns, then copy the temp into it.
-		 * Hash lookups on these chains are cheap (small string keys, packed
-		 * id-keyed inner array). */
+		 * The recursive dc_copy_value() call may grow the same hash tables
+		 * we are inserting into, so we never cache bucket pointers across
+		 * the call: write into a stack-local temp, then re-find and insert
+		 * after the call returns. */
 		uint32_t entry_id = entry->id;
 
 		zend_string *scope;
@@ -1395,9 +1365,6 @@ prepare_props:
 			zend_string *name;
 			zval *raw_val;
 			ZEND_HASH_FOREACH_STR_KEY_VAL(Z_ARRVAL_P(scope_vals), name, raw_val) {
-				/* Lazily promote ctx->properties to an array, then look up /
-				 * create properties[scope][name] WITHOUT caching the bucket
-				 * pointers across the recursion. */
 				if (Z_TYPE(ctx->properties) == IS_UNDEF) {
 					array_init_size(&ctx->properties, 1);
 				}
@@ -1414,38 +1381,26 @@ prepare_props:
 					out_name = zend_hash_add_new(Z_ARRVAL_P(out_scope), name, &new_ht);
 				}
 
-				/* Reserve our slot at properties[scope][name][entry_id] using
-				 * IS_NULL (NOT IS_UNDEF — zend_hash_index_find treats UNDEF
-				 * entries in packed arrays as tombstones and returns NULL).
-				 * The pointer returned by add_new may become stale during the
-				 * recursion below (if children grow this same hash), so we
-				 * don't keep it. */
+				/* Reserve a placeholder (IS_NULL, not IS_UNDEF — packed arrays
+				 * treat UNDEF as a tombstone in zend_hash_index_find). */
 				zval null_ph;
 				ZVAL_NULL(&null_ph);
 				zend_hash_index_add_new(Z_ARRVAL_P(out_name), entry_id, &null_ph);
 
-				/* Recurse into a stack-local temp; the child writes its
-				 * result here, immune to any rehash of out_name. */
+				/* Recurse into a stack-local temp, then re-find and insert. */
 				zval temp_dst;
 				ZVAL_UNDEF(&temp_dst);
 				zval mask_slot_zv;
 				ZVAL_UNDEF(&mask_slot_zv);
 				dc_copy_value(ctx, raw_val, &temp_dst, &mask_slot_zv);
-				/* No dc_mask_cleanup() — dc_pack_value() (called from
-				 * dc_build_output) handles dense IS_NULL placeholders. */
+				dc_mask_cleanup(&mask_slot_zv);
 
-				/* Re-find the destination slot — out_scope/out_name above
-				 * may now be stale, and the slot's address may have moved
-				 * if children rehashed out_name. The IS_NULL placeholder
-				 * we seeded carries no refcount, so we just overwrite it. */
 				out_scope = zend_hash_find(Z_ARRVAL(ctx->properties), scope);
 				out_name = zend_hash_find(Z_ARRVAL_P(out_scope), name);
 				zval *dst_slot = zend_hash_index_find(Z_ARRVAL_P(out_name), entry_id);
 				ZVAL_COPY_VALUE(dst_slot, &temp_dst);
 
 				if (Z_TYPE(mask_slot_zv) != IS_UNDEF && Z_TYPE(mask_slot_zv) != IS_NULL) {
-					/* Store the marker into resolve[scope][name][id]. Look up
-					 * fresh — recursion may have grown ctx->resolve too. */
 					if (Z_TYPE(ctx->resolve) == IS_UNDEF) {
 						array_init_size(&ctx->resolve, 1);
 					}
@@ -1490,282 +1445,6 @@ static int dc_compare_bucket_keys(Bucket *a, Bucket *b) {
 	if (a->h < b->h) return -1;
 	if (a->h > b->h) return 1;
 	return 0;
-}
-
-/* ── Bit-packed mask wire format ────────────────────────────── */
-
-/*
- * Wire format v2: each mask is a binary string of 2-bit slots, packed
- * 4 slots per byte (slot 0 occupies the LSBs, slot 3 the MSBs):
- *
- *   byte[i] = (slot[4i+3] << 6) | (slot[4i+2] << 4) | (slot[4i+1] << 2) | slot[4i]
- *
- * Slots are emitted depth-first over the parallel value structure: every
- * element of the value array is one slot, and a sub-array slot of value
- * 0b10 is followed immediately by the slots of its elements.
- *
- * Slot codes:
- *   0b00  literal — use the value as-is, do NOT recurse even if it's an array
- *   0b01  simple marker — interpret by value type:
- *           positive long → object reference (value is the pool id)
- *           negative long → hard reference (-value is the ref id)
- *           string        → enum (value is "Class::Case")
- *           array         → named closure (value is the encoded callable)
- *   0b10  nested mask — value is an array, recurse with the next slots
- *   0b11  reserved — decoder must reject
- *
- * Empty masks (no markers anywhere in the subtree) are omitted from the
- * output entirely; the absence of a mask means "every value is literal".
- */
-
-#define DC_BITS_LITERAL  0x0
-#define DC_BITS_MARKER   0x1
-#define DC_BITS_NESTED   0x2
-
-typedef struct {
-	smart_str s;
-	uint32_t  slot_idx;  /* total number of 2-bit slots written so far */
-} dc_bit_writer;
-
-static zend_always_inline void dc_bit_writer_init(dc_bit_writer *w)
-{
-	w->s.s = NULL;
-	w->s.a = 0;
-	w->slot_idx = 0;
-}
-
-static zend_always_inline void dc_bit_writer_free(dc_bit_writer *w)
-{
-	smart_str_free(&w->s);
-	w->slot_idx = 0;
-}
-
-/* Append a 2-bit slot. Allocates a fresh 0x00 byte every 4 slots and ORs
- * the new bits into the current byte at the right position. smart_str's
- * own doubling growth amortizes the allocation cost across slots. */
-static zend_always_inline void dc_bit_writer_write(dc_bit_writer *w, uint8_t bits)
-{
-	uint32_t shift = (w->slot_idx & 3) << 1;
-	w->slot_idx++;
-	if (shift == 0) {
-		smart_str_appendc(&w->s, 0);
-		if (bits == 0) return;
-	} else if (bits == 0) {
-		return;
-	}
-	ZSTR_VAL(w->s.s)[ZSTR_LEN(w->s.s) - 1] |= (uint8_t)((bits & 0x3) << shift);
-}
-
-/* Overwrite the 2-bit slot at `slot_idx` (which must already be a valid
- * position written via dc_bit_writer_write). Used by dc_pack_value() to
- * patch a placeholder LITERAL slot into NESTED after we discover that the
- * recursive walk did emit at least one marker bit. */
-static zend_always_inline void dc_bit_writer_patch(dc_bit_writer *w, uint32_t slot_idx, uint8_t bits)
-{
-	uint32_t byte_idx = slot_idx >> 2;
-	uint32_t shift = (slot_idx & 3) << 1;
-	ZSTR_VAL(w->s.s)[byte_idx] |= (uint8_t)((bits & 0x3) << shift);
-}
-
-/* Forward declarations: the two encoders are mutually recursive. */
-static bool dc_pack_value(zval *value, zval *struct_mask, dc_bit_writer *out);
-
-/* Iterate `value` (which must be an array) and its parallel structured
- * `mask_ht` (which may be NULL), writing 2-bit slots into `out` — one
- * slot per element of `value` in iteration order. Sub-arrays whose mask
- * is itself an array recurse depth-first via dc_pack_value().
- *
- * Used for masks that parallel an array's elements directly:
- *   - resolve[scope][name]   (parallel to properties[scope][name])
- *   - refMasks               (parallel to refs)
- *
- * Returns true if any non-zero bit was emitted. */
-static bool dc_pack_elements(zval *value, zval *struct_mask, dc_bit_writer *out)
-{
-	if (Z_TYPE_P(value) != IS_ARRAY) {
-		return false;
-	}
-	bool any_marker = false;
-	HashTable *value_ht = Z_ARRVAL_P(value);
-	HashTable *mask_ht = (struct_mask != NULL && Z_TYPE_P(struct_mask) == IS_ARRAY)
-		? Z_ARRVAL_P(struct_mask) : NULL;
-
-	/* Fast path: when value_ht and mask_ht are both packed with the same
-	 * element count, the encoder built them in lockstep so they share the
-	 * same key set in iteration order. Walk arPacked in lockstep, no hash
-	 * lookups. Most realistic graphs (object property arrays keyed by
-	 * sequential entry ids, top-level masks built by dc_copy_array's
-	 * pre-allocation) hit this path. */
-	if (mask_ht != NULL
-	 && HT_IS_PACKED(value_ht) && HT_IS_PACKED(mask_ht)
-	 && HT_IS_WITHOUT_HOLES(value_ht)
-	 && zend_hash_num_elements(value_ht) == zend_hash_num_elements(mask_ht)) {
-		uint32_t n = zend_hash_num_elements(value_ht);
-		zval *vp = value_ht->arPacked;
-		zval *mp = mask_ht->arPacked;
-		for (uint32_t i = 0; i < n; i++) {
-			if (dc_pack_value(vp + i, mp + i, out)) {
-				any_marker = true;
-			}
-		}
-		return any_marker;
-	}
-
-	/* Generic path: per-element lookup. */
-	zend_string *key;
-	zend_ulong  idx;
-	zval       *val;
-	ZEND_HASH_FOREACH_KEY_VAL(value_ht, idx, key, val) {
-		zval *sub_mask = NULL;
-		if (mask_ht != NULL) {
-			sub_mask = key
-				? zend_hash_find(mask_ht, key)
-				: zend_hash_index_find(mask_ht, idx);
-		}
-		if (dc_pack_value(val, sub_mask, out)) {
-			any_marker = true;
-		}
-	} ZEND_HASH_FOREACH_END();
-
-	return any_marker;
-}
-
-/* Write a single 2-bit slot describing `value` as a whole, plus any
- * sub-slots for nested arrays. The structured mask follows the existing
- * in-memory shape:
- *   NULL / UNDEF / NULL pointer  →  literal slot (00)
- *   array                        →  nested slot (10) + sub-bits via
- *                                   dc_pack_elements(), but only if the
- *                                   sub-walk emits at least one marker;
- *                                   otherwise the slot stays at 00 and we
- *                                   don't bloat the output with sub-zeroes
- *   anything else                →  simple-marker slot (01)
- *                                   (TRUE / FALSE / LONG 0 / STR "e")
- *
- * Used for value-level masks where the whole value carries a single
- * marker:
- *   - top-level `mask` (parallel to `prepared`)
- *   - state masks for __unserialize objects (parallel to entry->props)
- *
- * Returns true if any non-zero bit was emitted. The retroactive 00→10
- * patching means we no longer need a separate dc_mask_cleanup() pass over
- * the structured mask before conversion: stale IS_NULL placeholders just
- * produce 00 sub-slots, and an entirely-NULL sub-mask collapses back to a
- * single 00 parent slot via the rewind below. */
-static bool dc_pack_value(zval *value, zval *struct_mask, dc_bit_writer *out)
-{
-	if (struct_mask == NULL || Z_TYPE_P(struct_mask) == IS_NULL || Z_TYPE_P(struct_mask) == IS_UNDEF) {
-		dc_bit_writer_write(out, DC_BITS_LITERAL);
-		return false;
-	}
-	if (Z_TYPE_P(struct_mask) == IS_ARRAY) {
-		if (UNEXPECTED(Z_TYPE_P(value) != IS_ARRAY)) {
-			/* Defensive: a structured mask of array shape implies the
-			 * value should also be an array. Fall through to literal
-			 * rather than emitting a malformed nested slot. */
-			dc_bit_writer_write(out, DC_BITS_LITERAL);
-			return false;
-		}
-		uint32_t my_slot = out->slot_idx;
-		dc_bit_writer_write(out, DC_BITS_LITERAL); /* placeholder */
-		bool sub_marker = dc_pack_elements(value, struct_mask, out);
-		if (sub_marker) {
-			dc_bit_writer_patch(out, my_slot, DC_BITS_NESTED);
-			return true;
-		}
-		return false;
-	}
-	/* Simple marker — TRUE / FALSE / LONG 0 / STRING "e" */
-	dc_bit_writer_write(out, DC_BITS_MARKER);
-	return true;
-}
-
-/* Convert the writer's accumulated bytes into a single zend_string and
- * stash it into `dst` (a zval). Resets the writer. If no bytes were
- * written, leaves dst as IS_UNDEF and returns false. */
-static bool dc_bit_writer_finalize(dc_bit_writer *w, zval *dst)
-{
-	if (w->s.s == NULL || ZSTR_LEN(w->s.s) == 0) {
-		smart_str_free(&w->s);
-		ZVAL_UNDEF(dst);
-		w->slot_idx = 0;
-		return false;
-	}
-	smart_str_0(&w->s);
-	ZVAL_STR(dst, w->s.s);
-	w->s.s = NULL;
-	w->s.a = 0;
-	w->slot_idx = 0;
-	return true;
-}
-
-/* Convenience: pack a value-level mask (one slot for the whole value plus
- * sub-slots for nested arrays) into a fresh zend_string zval. Used for the
- * top-level `mask` and `__unserialize` state masks. Returns true if any
- * non-zero bit was written; in that case `dst` holds the binary string.
- * Otherwise `dst` is left UNDEF. */
-static bool dc_pack_value_to_zval(zval *value, zval *struct_mask, zval *dst)
-{
-	dc_bit_writer w;
-	dc_bit_writer_init(&w);
-	bool any_marker = dc_pack_value(value, struct_mask, &w);
-	if (!any_marker) {
-		dc_bit_writer_free(&w);
-		ZVAL_UNDEF(dst);
-		return false;
-	}
-	return dc_bit_writer_finalize(&w, dst);
-}
-
-/* Convenience: pack an element-level mask (slots parallel to value's array
- * elements in iteration order) into a fresh zend_string zval. Used for
- * resolve[scope][name] entries. Returns true if any non-zero bit was
- * written. */
-static bool dc_pack_elements_to_zval(zval *value, zval *struct_mask, zval *dst)
-{
-	dc_bit_writer w;
-	dc_bit_writer_init(&w);
-	bool any_marker = dc_pack_elements(value, struct_mask, &w);
-	if (!any_marker) {
-		dc_bit_writer_free(&w);
-		ZVAL_UNDEF(dst);
-		return false;
-	}
-	return dc_bit_writer_finalize(&w, dst);
-}
-
-/* Read a 2-bit slot from a bit-packed mask string. Returns 0 (literal)
- * for out-of-bounds reads — callers must rely on bounds checking via
- * the explicit slot_idx counter, this is just a defensive default. */
-static zend_always_inline uint8_t dc_bit_read(const uint8_t *bits, size_t bits_len, uint32_t slot_idx)
-{
-	uint32_t byte_idx = slot_idx >> 2;
-	if (UNEXPECTED(byte_idx >= bits_len)) {
-		return DC_BITS_LITERAL;
-	}
-	uint32_t shift = (slot_idx & 3) << 1;
-	return (uint8_t)((bits[byte_idx] >> shift) & 0x3);
-}
-
-/* Sequential reader over a bit-packed mask string. The reader is mutated
- * in place by dc_resolve_value() (which advances `pos` by one slot, plus
- * any sub-slots a nested-mask byte consumes). */
-typedef struct {
-	const uint8_t *bits;
-	size_t         bits_len;
-	uint32_t       pos;
-} dc_bit_reader;
-
-static zend_always_inline void dc_bit_reader_init(dc_bit_reader *r, const zend_string *s)
-{
-	if (s != NULL) {
-		r->bits = (const uint8_t *)ZSTR_VAL(s);
-		r->bits_len = ZSTR_LEN(s);
-	} else {
-		r->bits = NULL;
-		r->bits_len = 0;
-	}
-	r->pos = 0;
 }
 
 /* ── Build final output array ───────────────────────────────── */
@@ -1831,28 +1510,15 @@ static void dc_build_output(dc_ctx *ctx, zval *prepared, zval *top_mask, zval *r
 			ZVAL_LONG(&zid, id);
 			zend_hash_index_add_new(Z_ARRVAL(states), (zend_ulong)e->wakeup, &zid);
 		} else if (e->wakeup < 0) {
-			/* For __unserialize objects, convert the structured prop_mask
-			 * into a bit-packed string. The mask describes e->props as a
-			 * whole (one leading slot, plus sub-slots if it's a nested
-			 * array). Empty masks collapse to UNDEF and the state entry
-			 * omits its third slot. */
-			zval zmask;
-			ZVAL_UNDEF(&zmask);
-			if (e->prop_mask) {
-				zval zprops_view, zmask_view;
-				ZVAL_ARR(&zprops_view, e->props);
-				ZVAL_ARR(&zmask_view, e->prop_mask);
-				dc_pack_value_to_zval(&zprops_view, &zmask_view, &zmask);
-				zend_array_destroy(e->prop_mask);
-				e->prop_mask = NULL;
-			}
 			zval state_entry;
-			if (Z_TYPE(zmask) != IS_UNDEF) {
+			if (e->prop_mask) {
 				array_init_size(&state_entry, 3);
-				zval zid, zprops;
+				zval zid, zprops, zmask;
 				ZVAL_LONG(&zid, id);
 				ZVAL_ARR(&zprops, e->props);
 				GC_TRY_ADDREF(e->props);
+				ZVAL_ARR(&zmask, e->prop_mask);
+				GC_TRY_ADDREF(e->prop_mask);
 				zend_hash_index_add_new(Z_ARRVAL(state_entry), 0, &zid);
 				zend_hash_index_add_new(Z_ARRVAL(state_entry), 1, &zprops);
 				zend_hash_index_add_new(Z_ARRVAL(state_entry), 2, &zmask);
@@ -1867,24 +1533,17 @@ static void dc_build_output(dc_ctx *ctx, zval *prepared, zval *top_mask, zval *r
 			}
 			zend_hash_index_add_new(Z_ARRVAL(states), (zend_ulong) -e->wakeup, &state_entry);
 			e->props = NULL;      /* Owned by states now */
+			e->prop_mask = NULL;  /* Owned by states now */
 		}
 	}
 
 	/* Sort states by key */
 	zend_hash_sort(Z_ARRVAL(states), dc_compare_bucket_keys, 0);
 
-	/* ── Build refs and refMasks ──────────────────
-	 * refMasks is a single bit-packed string parallel to refs in iteration
-	 * order. Each ref takes one slot: 01 for simple markers (object ref or
-	 * enum ref), 10 for nested masks (array refs with sub-markers, followed
-	 * by the depth-first sub-bits), 00 for plain scalar/array refs without
-	 * any marker. */
-	zval refs_out;
+	/* ── Build refs and refMasks ────────────────── */
+	zval refs_out, ref_masks_out;
 	array_init_size(&refs_out, shared_refs);
-
-	dc_bit_writer ref_mask_writer;
-	dc_bit_writer_init(&ref_mask_writer);
-	bool any_ref_marker = false;
+	array_init_size(&ref_masks_out, 0);
 
 	for (uint32_t i = 0; i < ctx->refs_count; i++) {
 		dc_ref_entry *re = &ctx->refs[i];
@@ -1903,12 +1562,12 @@ static void dc_build_output(dc_ctx *ctx, zval *prepared, zval *top_mask, zval *r
 				zval zid;
 				ZVAL_LONG(&zid, pe->id);
 				zend_hash_index_add_new(Z_ARRVAL(refs_out), ref_id, &zid);
-				dc_bit_writer_write(&ref_mask_writer, DC_BITS_MARKER);
-				any_ref_marker = true;
+				zval marker;
+				ZVAL_TRUE(&marker);
+				zend_hash_index_add_new(Z_ARRVAL(ref_masks_out), ref_id, &marker);
 			} else {
 				Z_TRY_ADDREF_P(cur);
 				zend_hash_index_add_new(Z_ARRVAL(refs_out), ref_id, cur);
-				dc_bit_writer_write(&ref_mask_writer, DC_BITS_LITERAL);
 			}
 		} else if (Z_TYPE_P(orig) == IS_OBJECT && (Z_OBJCE_P(orig)->ce_flags & ZEND_ACC_ENUM)) {
 			/* UnitEnum ref — synthesize "Class::Case" once per occurrence.
@@ -1929,26 +1588,19 @@ static void dc_build_output(dc_ctx *ctx, zval *prepared, zval *top_mask, zval *r
 			zval zenum;
 			ZVAL_STR(&zenum, enum_str);
 			zend_hash_index_add_new(Z_ARRVAL(refs_out), ref_id, &zenum);
-			dc_bit_writer_write(&ref_mask_writer, DC_BITS_MARKER);
-			any_ref_marker = true;
+			zval marker;
+			ZVAL_INTERNED_STR(&marker, zend_string_init_interned("e", 1, 0));
+			zend_hash_index_add_new(Z_ARRVAL(ref_masks_out), ref_id, &marker);
 		} else {
-			/* Scalar or array ref — use saved cur_value and cur_mask.
-			 * dc_pack_value() emits one slot for the whole value (00/01/10)
-			 * and recurses into sub-elements when the mask is array-shaped. */
+			/* Scalar or array ref — use saved cur_value and cur_mask */
 			Z_TRY_ADDREF_P(cur);
 			zend_hash_index_add_new(Z_ARRVAL(refs_out), ref_id, cur);
-			if (dc_pack_value(cur, &re->cur_mask, &ref_mask_writer)) {
-				any_ref_marker = true;
+			if (Z_TYPE(re->cur_mask) != IS_NULL) {
+				zval mask_copy;
+				ZVAL_COPY(&mask_copy, &re->cur_mask);
+				zend_hash_index_add_new(Z_ARRVAL(ref_masks_out), ref_id, &mask_copy);
 			}
 		}
-	}
-
-	zval ref_masks_out;
-	if (any_ref_marker) {
-		dc_bit_writer_finalize(&ref_mask_writer, &ref_masks_out);
-	} else {
-		dc_bit_writer_free(&ref_mask_writer);
-		ZVAL_UNDEF(&ref_masks_out);
 	}
 
 	/* ── Assemble output ───────────────────────── */
@@ -1997,16 +1649,10 @@ static void dc_build_output(dc_ctx *ctx, zval *prepared, zval *top_mask, zval *r
 	Z_TRY_ADDREF_P(prepared);
 	zend_hash_add_new(Z_ARRVAL_P(return_value), dc_key_prepared, prepared);
 
-	/* mask: convert the structured top_mask to a bit-packed string (if
-	 * the prepared root isn't a plain integer — those are handled by the
-	 * "prepared is LONG" fast path on the decoder side without a mask).
-	 * Top-level masks are value-level: one leading slot for `prepared` as
-	 * a whole, then sub-slots if it's a nested array. */
+	/* mask (if non-empty and prepared is not a plain integer) */
 	if (Z_TYPE_P(prepared) != IS_LONG && has_mask) {
-		zval packed;
-		if (dc_pack_value_to_zval(prepared, top_mask, &packed)) {
-			zend_hash_add_new(Z_ARRVAL_P(return_value), dc_key_mask, &packed);
-		}
+		Z_TRY_ADDREF_P(top_mask);
+		zend_hash_add_new(Z_ARRVAL_P(return_value), dc_key_mask, top_mask);
 	}
 
 	/* properties (if non-empty) — transfer ownership from ctx */
@@ -2016,51 +1662,11 @@ static void dc_build_output(dc_ctx *ctx, zval *prepared, zval *top_mask, zval *r
 		zend_hash_add_new(Z_ARRVAL_P(return_value), dc_key_properties, &p);
 	}
 
-	/* resolve: convert each resolve[scope][name] structured mask into a
-	 * bit-packed string parallel to properties[scope][name] (in iteration
-	 * order, with depth-first sub-bits for nested values). */
-	if (Z_TYPE(ctx->resolve) == IS_ARRAY && zend_hash_num_elements(Z_ARRVAL(ctx->resolve)) > 0
-	 && Z_TYPE(ctx->properties) == IS_ARRAY) {
-		zval resolve_out;
-		array_init_size(&resolve_out, zend_hash_num_elements(Z_ARRVAL(ctx->resolve)));
-
-		zend_string *scope_key;
-		zval *scope_resolve;
-		ZEND_HASH_FOREACH_STR_KEY_VAL(Z_ARRVAL(ctx->resolve), scope_key, scope_resolve) {
-			if (!scope_key || Z_TYPE_P(scope_resolve) != IS_ARRAY) continue;
-			zval *scope_props = zend_hash_find(Z_ARRVAL(ctx->properties), scope_key);
-			if (!scope_props || Z_TYPE_P(scope_props) != IS_ARRAY) continue;
-
-			zval scope_out;
-			array_init_size(&scope_out, zend_hash_num_elements(Z_ARRVAL_P(scope_resolve)));
-
-			zend_string *name_key;
-			zval *name_resolve;
-			ZEND_HASH_FOREACH_STR_KEY_VAL(Z_ARRVAL_P(scope_resolve), name_key, name_resolve) {
-				if (!name_key || Z_TYPE_P(name_resolve) != IS_ARRAY) continue;
-				zval *name_props = zend_hash_find(Z_ARRVAL_P(scope_props), name_key);
-				if (!name_props || Z_TYPE_P(name_props) != IS_ARRAY) continue;
-
-				/* Per-property masks parallel name_props's elements
-				 * directly (no leading "whole-array" slot). */
-				zval packed;
-				if (dc_pack_elements_to_zval(name_props, name_resolve, &packed)) {
-					zend_hash_add_new(Z_ARRVAL(scope_out), name_key, &packed);
-				}
-			} ZEND_HASH_FOREACH_END();
-
-			if (zend_hash_num_elements(Z_ARRVAL(scope_out)) > 0) {
-				zend_hash_add_new(Z_ARRVAL(resolve_out), scope_key, &scope_out);
-			} else {
-				zval_ptr_dtor(&scope_out);
-			}
-		} ZEND_HASH_FOREACH_END();
-
-		if (zend_hash_num_elements(Z_ARRVAL(resolve_out)) > 0) {
-			zend_hash_add_new(Z_ARRVAL_P(return_value), dc_key_resolve, &resolve_out);
-		} else {
-			zval_ptr_dtor(&resolve_out);
-		}
+	/* resolve (if non-empty) — transfer ownership from ctx */
+	if (Z_TYPE(ctx->resolve) == IS_ARRAY && zend_hash_num_elements(Z_ARRVAL(ctx->resolve)) > 0) {
+		zval r;
+		ZVAL_COPY(&r, &ctx->resolve);
+		zend_hash_add_new(Z_ARRVAL_P(return_value), dc_key_resolve, &r);
 	}
 
 	/* states (if non-empty) */
@@ -2077,9 +1683,11 @@ static void dc_build_output(dc_ctx *ctx, zval *prepared, zval *top_mask, zval *r
 		zval_ptr_dtor(&refs_out);
 	}
 
-	/* refMasks (bit-packed string parallel to refs) */
-	if (Z_TYPE(ref_masks_out) == IS_STRING) {
+	/* refMasks (if non-empty) */
+	if (zend_hash_num_elements(Z_ARRVAL(ref_masks_out)) > 0) {
 		zend_hash_add_new(Z_ARRVAL_P(return_value), dc_key_ref_masks, &ref_masks_out);
+	} else {
+		zval_ptr_dtor(&ref_masks_out);
 	}
 
 	/* Pool entries whose props/prop_mask were moved into states above had those
@@ -2196,89 +1804,68 @@ PHP_FUNCTION(deepclone_to_array)
 
 /* ── deepclone_from_array() — reconstruct the value graph ──── */
 
-static void dc_resolve_value(zval *value, dc_bit_reader *reader, zval *objects, HashTable *refs, zval *retval);
-
 /*
- * Apply a known 2-bit slot value to a value, writing the resolved value to
- * *retval. The bit reader is advanced for any nested sub-slots (when bits ==
- * DC_BITS_NESTED). Throws \ValueError on malformed input — callers must
- * check EG(exception) after calling and bail out if set.
+ * Resolve a value using its mask marker. Writes the resolved value to *retval.
+ * Throws \ValueError on malformed input — callers must check EG(exception)
+ * after calling and bail out if set.
  *
- *   0b00  literal           — value is used as-is
- *   0b01  simple marker     — interpret value by type:
- *                              positive long → object reference
- *                              negative long → hard PHP &-reference
- *                              string        → enum (Class::Case)
- *                              array         → named closure
- *   0b10  nested mask       — value is an array, recurse with sub-bits
- *   0b11  reserved
+ *   true   object reference     →  objects[value]    (value is the pool id)
+ *   false  hard PHP &-reference →  &refs[-value]
+ *   0      named closure        →  reconstruct callable from value
+ *   'e'    UnitEnum             →  resolve "Class::Case" string
+ *   array  nested mask          →  recurse into the array's elements
+ *   other  no marker            →  copy value as-is
  */
-static void dc_apply_bits(uint8_t bits, zval *value, dc_bit_reader *reader, zval *objects, HashTable *refs, zval *retval)
+static void dc_resolve(zval *value, zval *mask, zval *objects, HashTable *refs, zval *retval)
 {
-	if (EXPECTED(bits == DC_BITS_LITERAL)) {
-		ZVAL_COPY(retval, value);
+	if (EXPECTED(DC_MASK_IS_OBJ_REF(mask))) {
+		if (UNEXPECTED(Z_TYPE_P(value) != IS_LONG)) {
+			zend_value_error("deepclone_from_array(): malformed payload, object reference value must be of type int, %s given", zend_zval_value_name(value));
+			return;
+		}
+		zend_long id = Z_LVAL_P(value);
+		zval *target;
+		if (EXPECTED(id >= 0)) {
+			target = zend_hash_index_find(Z_ARRVAL_P(objects), id);
+			if (UNEXPECTED(!target)) {
+				zend_value_error("deepclone_from_array(): malformed payload, unknown object id " ZEND_LONG_FMT, id);
+				return;
+			}
+		} else {
+			target = zend_hash_index_find(refs, -id);
+			if (UNEXPECTED(!target)) {
+				zend_value_error("deepclone_from_array(): malformed payload, unknown ref id " ZEND_LONG_FMT, -id);
+				return;
+			}
+		}
+		ZVAL_COPY(retval, target);
 		return;
 	}
 
-	if (bits == DC_BITS_MARKER) {
-		/* Type-dispatched simple marker: the value's type unambiguously
-		 * picks one of obj_ref / hard_ref / enum / named_closure. */
-		if (Z_TYPE_P(value) == IS_LONG) {
-			zend_long id = Z_LVAL_P(value);
-			if (EXPECTED(id >= 0)) {
-				zval *target = zend_hash_index_find(Z_ARRVAL_P(objects), id);
-				if (UNEXPECTED(!target)) {
-					zend_value_error("deepclone_from_array(): malformed payload, unknown object id " ZEND_LONG_FMT, id);
-					return;
-				}
-				ZVAL_COPY(retval, target);
-			} else {
-				zval *ref_slot = zend_hash_index_find(refs, -id);
-				if (UNEXPECTED(!ref_slot)) {
-					zend_value_error("deepclone_from_array(): malformed payload, unknown ref id " ZEND_LONG_FMT, -id);
-					return;
-				}
-				if (!Z_ISREF_P(ref_slot)) {
-					ZVAL_MAKE_REF(ref_slot);
-				}
-				ZVAL_COPY(retval, ref_slot);
-			}
+	if (DC_MASK_IS_HARD_REF(mask)) {
+		if (UNEXPECTED(Z_TYPE_P(value) != IS_LONG)) {
+			zend_value_error("deepclone_from_array(): malformed payload, hard-ref value must be of type int, %s given", zend_zval_value_name(value));
 			return;
 		}
+		zend_long rid = -Z_LVAL_P(value);
+		zval *ref_slot = zend_hash_index_find(refs, rid);
+		if (UNEXPECTED(!ref_slot)) {
+			zend_value_error("deepclone_from_array(): malformed payload, unknown ref id " ZEND_LONG_FMT, rid);
+			return;
+		}
+		if (!Z_ISREF_P(ref_slot)) {
+			ZVAL_MAKE_REF(ref_slot);
+		}
+		ZVAL_COPY(retval, ref_slot);
+		return;
+	}
 
-		if (Z_TYPE_P(value) == IS_STRING) {
-			/* UnitEnum: parse "Class::Case", resolve via zend_enum_get_case */
-			const char *s = Z_STRVAL_P(value);
-			const char *sep = strstr(s, "::");
-			if (!sep) {
-				zend_value_error("deepclone_from_array(): malformed payload, enum value must match \"Class::Case\"");
-				return;
-			}
-			zend_string *class_name = zend_string_init_existing_interned(s, sep - s, 0);
-			zend_string *case_name = zend_string_init_existing_interned(sep + 2, Z_STRLEN_P(value) - (sep - s) - 2, 0);
-			zend_class_entry *ce = zend_lookup_class(class_name);
-			if (!ce || !(ce->ce_flags & ZEND_ACC_ENUM)) {
-				zend_string_release(class_name);
-				zend_string_release(case_name);
-				zend_value_error("deepclone_from_array(): malformed payload, enum class \"%s\" not found", s);
-				return;
-			}
-			zend_object *case_obj = zend_enum_get_case(ce, case_name);
-			zend_string_release(class_name);
-			zend_string_release(case_name);
-			if (!case_obj) {
-				zend_value_error("deepclone_from_array(): malformed payload, enum case \"%s\" not found", s);
-				return;
-			}
-			ZVAL_OBJ_COPY(retval, case_obj);
-			return;
-		}
-
-		if (Z_TYPE_P(value) != IS_ARRAY) {
-			zend_value_error("deepclone_from_array(): malformed payload, simple-marker value must be int, string or array, %s given", zend_zval_value_name(value));
-			return;
-		}
+	if (DC_MASK_IS_NAMED_CLOSURE(mask)) {
 		/* Named closure: value is [obj_or_class, method] or [[callable], class, method] */
+		if (Z_TYPE_P(value) != IS_ARRAY) {
+			zend_value_error("deepclone_from_array(): malformed payload, named-closure value must be of type array, %s given", zend_zval_value_name(value));
+			return;
+		}
 		zval *arr = value;
 		zval *elem0 = zend_hash_index_find(Z_ARRVAL_P(arr), 0);
 		zval *elem1 = zend_hash_index_find(Z_ARRVAL_P(arr), 1);
@@ -2382,28 +1969,85 @@ static void dc_apply_bits(uint8_t bits, zval *value, dc_bit_reader *reader, zval
 		return;
 	}
 
-	if (bits == DC_BITS_NESTED) {
-		/* Nested mask: value must be an array. Walk it in iteration order
-		 * and read one slot per element from the same reader, recursing
-		 * for sub-arrays. The result array preserves keys. */
-		if (UNEXPECTED(Z_TYPE_P(value) != IS_ARRAY)) {
-			zend_value_error("deepclone_from_array(): malformed payload, nested-mask value must be of type array, %s given", zend_zval_value_name(value));
+	if (Z_TYPE_P(mask) == IS_STRING && ZSTR_LEN(Z_STR_P(mask)) == 1 && ZSTR_VAL(Z_STR_P(mask))[0] == 'e') {
+		/* UnitEnum: parse "Class::Case", resolve via zend_enum_get_case */
+		if (Z_TYPE_P(value) != IS_STRING) {
+			zend_value_error("deepclone_from_array(): malformed payload, enum value must be of type string, %s given", zend_zval_value_name(value));
 			return;
 		}
-		zval result;
-		ZVAL_DUP(&result, value);
-		SEPARATE_ARRAY(&result);
+		const char *s = Z_STRVAL_P(value);
+		const char *sep = strstr(s, "::");
+		if (!sep) {
+			zend_value_error("deepclone_from_array(): malformed payload, enum value must match \"Class::Case\"");
+			return;
+		}
+		zend_string *class_name = zend_string_init_existing_interned(s, sep - s, 0);
+		zend_string *case_name = zend_string_init_existing_interned(sep + 2, Z_STRLEN_P(value) - (sep - s) - 2, 0);
+		zend_class_entry *ce = zend_lookup_class(class_name);
+		if (!ce || !(ce->ce_flags & ZEND_ACC_ENUM)) {
+			zend_string_release(class_name);
+			zend_string_release(case_name);
+			zend_value_error("deepclone_from_array(): malformed payload, enum class \"%s\" not found", s);
+			return;
+		}
+		zend_object *case_obj = zend_enum_get_case(ce, case_name);
+		zend_string_release(class_name);
+		zend_string_release(case_name);
+		if (!case_obj) {
+			zend_value_error("deepclone_from_array(): malformed payload, enum case \"%s\" not found", s);
+			return;
+		}
+		ZVAL_OBJ_COPY(retval, case_obj);
+		return;
+	}
 
-		zend_string *key;
-		zend_ulong  idx;
-		zval       *slot;
-		ZEND_HASH_FOREACH_KEY_VAL(Z_ARRVAL(result), idx, key, slot) {
-			(void)idx; (void)key;
+	if (Z_TYPE_P(mask) != IS_ARRAY) {
+		ZVAL_COPY(retval, value);
+		return;
+	}
+
+	/* Array mask: recurse, handling & refs inline */
+	if (Z_TYPE_P(value) != IS_ARRAY) {
+		zend_value_error("deepclone_from_array(): malformed payload, array-mask value must be of type array, %s given", zend_zval_value_name(value));
+		return;
+	}
+	zval result;
+	ZVAL_DUP(&result, value);
+	SEPARATE_ARRAY(&result);
+
+	zend_string *mkey;
+	zend_ulong midx;
+	zval *mval;
+	ZEND_HASH_FOREACH_KEY_VAL(Z_ARRVAL_P(mask), midx, mkey, mval) {
+		zval *slot = mkey
+			? zend_hash_find(Z_ARRVAL(result), mkey)
+			: zend_hash_index_find(Z_ARRVAL(result), midx);
+		if (!slot) continue;
+
+		if (Z_TYPE_P(mval) == IS_FALSE) {
+			/* Hard ref: create PHP & reference */
+			if (Z_TYPE_P(slot) != IS_LONG) {
+				zval_ptr_dtor(&result);
+				zend_value_error("deepclone_from_array(): malformed payload, hard-ref slot must be of type int, %s given", zend_zval_value_name(slot));
+				return;
+			}
+			zend_long rid = -Z_LVAL_P(slot);
+			zval *ref_slot = zend_hash_index_find(refs, rid);
+			if (!ref_slot) {
+				zval_ptr_dtor(&result);
+				zend_value_error("deepclone_from_array(): malformed payload, unknown ref id " ZEND_LONG_FMT, rid);
+				return;
+			}
+			if (!Z_ISREF_P(ref_slot)) {
+				ZVAL_MAKE_REF(ref_slot);
+			}
+			zval_ptr_dtor(slot);
+			ZVAL_COPY(slot, ref_slot);
+		} else {
 			zval resolved;
 			ZVAL_UNDEF(&resolved);
-			dc_resolve_value(slot, reader, objects, refs, &resolved);
-			if (UNEXPECTED(EG(exception))) {
-				zval_ptr_dtor(&resolved);
+			dc_resolve(slot, mval, objects, refs, &resolved);
+			if (EG(exception)) {
 				zval_ptr_dtor(&result);
 				return;
 			}
@@ -2411,23 +2055,10 @@ static void dc_apply_bits(uint8_t bits, zval *value, dc_bit_reader *reader, zval
 				zval_ptr_dtor(slot);
 				ZVAL_COPY_VALUE(slot, &resolved);
 			}
-		} ZEND_HASH_FOREACH_END();
+		}
+	} ZEND_HASH_FOREACH_END();
 
-		ZVAL_COPY_VALUE(retval, &result);
-		return;
-	}
-
-	/* bits == 0b11 — reserved, decoder rejects */
-	zend_value_error("deepclone_from_array(): malformed payload, mask uses reserved slot code 0b11");
-}
-
-/* Read the next 2-bit slot from `reader` and apply it to `value`. Wrapper
- * around dc_apply_bits() for the common "consume one slot" call pattern. */
-static void dc_resolve_value(zval *value, dc_bit_reader *reader, zval *objects, HashTable *refs, zval *retval)
-{
-	uint8_t bits = dc_bit_read(reader->bits, reader->bits_len, reader->pos);
-	reader->pos++;
-	dc_apply_bits(bits, value, reader, objects, refs, retval);
+	ZVAL_COPY_VALUE(retval, &result);
 }
 
 /* Throw a ValueError describing malformed input and jump to the cleanup label. */
@@ -2480,8 +2111,6 @@ PHP_FUNCTION(deepclone_from_array)
 		"deepclone_from_array(): Argument #1 ($data) \"classes\" must be of type string|array, %s given", zend_zval_value_name(zclasses));
 	DC_REQUIRE(Z_TYPE_P(zobject_meta) == IS_LONG || Z_TYPE_P(zobject_meta) == IS_ARRAY,
 		"deepclone_from_array(): Argument #1 ($data) \"objectMeta\" must be of type int|array, %s given", zend_zval_value_name(zobject_meta));
-	DC_REQUIRE(!zmask || Z_TYPE_P(zmask) == IS_STRING,
-		"deepclone_from_array(): Argument #1 ($data) \"mask\" must be of type string, %s given", zend_zval_value_name(zmask));
 	DC_REQUIRE(!zproperties || Z_TYPE_P(zproperties) == IS_ARRAY,
 		"deepclone_from_array(): Argument #1 ($data) \"properties\" must be of type array, %s given", zend_zval_value_name(zproperties));
 	DC_REQUIRE(!zresolve || Z_TYPE_P(zresolve) == IS_ARRAY,
@@ -2490,8 +2119,8 @@ PHP_FUNCTION(deepclone_from_array)
 		"deepclone_from_array(): Argument #1 ($data) \"states\" must be of type array, %s given", zend_zval_value_name(zstates));
 	DC_REQUIRE(!zrefs || Z_TYPE_P(zrefs) == IS_ARRAY,
 		"deepclone_from_array(): Argument #1 ($data) \"refs\" must be of type array, %s given", zend_zval_value_name(zrefs));
-	DC_REQUIRE(!zref_masks || Z_TYPE_P(zref_masks) == IS_STRING,
-		"deepclone_from_array(): Argument #1 ($data) \"refMasks\" must be of type string, %s given", zend_zval_value_name(zref_masks));
+	DC_REQUIRE(!zref_masks || Z_TYPE_P(zref_masks) == IS_ARRAY,
+		"deepclone_from_array(): Argument #1 ($data) \"refMasks\" must be of type array, %s given", zend_zval_value_name(zref_masks));
 
 	/* ── Expand class names ────────────────────── */
 	zend_hash_init(&class_list, 4, NULL, NULL, 0);
@@ -2632,27 +2261,17 @@ PHP_FUNCTION(deepclone_from_array)
 			zend_hash_index_add_new(&refs, rid, &copy);
 		} ZEND_HASH_FOREACH_END();
 
-		/* Second pass: walk refs in iteration order and consume one slot
-		 * per ref from the bit-packed refMasks string. */
+		/* Second pass: resolve those with masks, updating in-place */
 		if (zref_masks) {
-			dc_bit_reader reader;
-			dc_bit_reader_init(&reader, Z_STR_P(zref_masks));
-			zval *rval2;
-			zend_ulong rid2;
-			ZEND_HASH_FOREACH_NUM_KEY_VAL(Z_ARRVAL_P(zrefs), rid2, rval2) {
-				(void)rval2;
-				zval *slot = zend_hash_index_find(&refs, rid2);
-				if (!slot) {
-					/* Still consume one slot to keep reader aligned */
-					reader.pos++;
-					continue;
-				}
+			zval *rmask;
+			ZEND_HASH_FOREACH_NUM_KEY_VAL(Z_ARRVAL_P(zref_masks), rid, rmask) {
+				zval *slot = zend_hash_index_find(&refs, rid);
+				if (!slot) continue;
 				zval resolved;
 				ZVAL_UNDEF(&resolved);
-				dc_resolve_value(slot, &reader, &objects, &refs, &resolved);
+				dc_resolve(slot, rmask, &objects, &refs, &resolved);
 				if (EG(exception)) goto cleanup;
-				if (Z_ISUNDEF(resolved)) continue;
-				/* Write through reference if slot was made into one */
+				/* Write through reference if slot was made into one (by dc_resolve) */
 				if (Z_ISREF_P(slot)) {
 					zval *inner = Z_REFVAL_P(slot);
 					zval_ptr_dtor(inner);
@@ -2725,18 +2344,16 @@ PHP_FUNCTION(deepclone_from_array)
 					DC_INVALID("deepclone_from_array(): Argument #1 ($data) \"properties\" value for \"%s::%s\" must be of type array, %s given", ZSTR_VAL(scope_name), ZSTR_VAL(prop_name), zend_zval_value_name(id_values));
 				}
 
-				/* Per-property resolve mask: a bit-packed string parallel
-				 * to id_values in iteration order. Absent → all literals. */
-				dc_bit_reader prop_reader;
-				dc_bit_reader_init(&prop_reader, NULL);
+				/* Get resolve markers for this property */
+				HashTable *resolve_ids = NULL;
 				if (resolve_scope) {
 					zval *ri = zend_hash_find(resolve_scope, prop_name);
 					if (ri) {
-						if (Z_TYPE_P(ri) != IS_STRING) {
+						if (Z_TYPE_P(ri) != IS_ARRAY) {
 							EG(fake_scope) = old_scope;
-							DC_INVALID("deepclone_from_array(): Argument #1 ($data) \"resolve\" value for \"%s::%s\" must be of type string, %s given", ZSTR_VAL(scope_name), ZSTR_VAL(prop_name), zend_zval_value_name(ri));
+							DC_INVALID("deepclone_from_array(): Argument #1 ($data) \"resolve\" value for \"%s::%s\" must be of type array, %s given", ZSTR_VAL(scope_name), ZSTR_VAL(prop_name), zend_zval_value_name(ri));
 						}
-						dc_bit_reader_init(&prop_reader, Z_STR_P(ri));
+						resolve_ids = Z_ARRVAL_P(ri);
 					}
 				}
 
@@ -2744,21 +2361,16 @@ PHP_FUNCTION(deepclone_from_array)
 				zval *prop_val;
 				ZEND_HASH_FOREACH_NUM_KEY_VAL(Z_ARRVAL_P(id_values), obj_id, prop_val) {
 					zval *obj_zval = zend_hash_index_find(Z_ARRVAL(objects), obj_id);
-					if (!obj_zval) {
-						if (prop_reader.bits) prop_reader.pos++; /* keep alignment */
-						continue;
-					}
+					if (!obj_zval) continue;
 
 					zval final_val;
-					if (prop_reader.bits) {
+					zval *marker = resolve_ids ? zend_hash_index_find(resolve_ids, obj_id) : NULL;
+					if (marker) {
 						ZVAL_UNDEF(&final_val);
-						dc_resolve_value(prop_val, &prop_reader, &objects, &refs, &final_val);
+						dc_resolve(prop_val, marker, &objects, &refs, &final_val);
 						if (EG(exception)) {
 							EG(fake_scope) = old_scope;
 							goto cleanup;
-						}
-						if (Z_ISUNDEF(final_val)) {
-							ZVAL_COPY(&final_val, prop_val);
 						}
 					} else {
 						ZVAL_COPY(&final_val, prop_val);
@@ -2808,13 +2420,8 @@ PHP_FUNCTION(deepclone_from_array)
 				}
 				zval resolved_props;
 				if (smask) {
-					if (Z_TYPE_P(smask) != IS_STRING) {
-						DC_INVALID("deepclone_from_array(): Argument #1 ($data) \"states\" entry mask must be of type string, %s given", zend_zval_value_name(smask));
-					}
-					dc_bit_reader smask_reader;
-					dc_bit_reader_init(&smask_reader, Z_STR_P(smask));
 					ZVAL_UNDEF(&resolved_props);
-					dc_resolve_value(sprops, &smask_reader, &objects, &refs, &resolved_props);
+					dc_resolve(sprops, smask, &objects, &refs, &resolved_props);
 					if (EG(exception)) goto cleanup;
 				} else {
 					ZVAL_COPY(&resolved_props, sprops);
@@ -2859,10 +2466,7 @@ PHP_FUNCTION(deepclone_from_array)
 			ZVAL_COPY(return_value, ref);
 		}
 	} else if (zmask) {
-		/* Top-level mask: one leading slot for `prepared` as a whole. */
-		dc_bit_reader top_reader;
-		dc_bit_reader_init(&top_reader, Z_STR_P(zmask));
-		dc_resolve_value(zprepared, &top_reader, &objects, &refs, return_value);
+		dc_resolve(zprepared, zmask, &objects, &refs, return_value);
 		if (EG(exception)) goto cleanup;
 	} else {
 		ZVAL_COPY(return_value, zprepared);

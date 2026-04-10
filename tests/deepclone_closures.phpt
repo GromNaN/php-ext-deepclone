@@ -12,13 +12,9 @@ class ClosureTest {
     public function getPrivateClosure(): \Closure { return $this->privateMethod(...); }
 }
 
-// Top-level mask for a named closure: one slot for the whole `prepared`
-// (the encoded callable array) carrying the simple-marker bits 0b01 →
-// the bitstring is "\x01".
-
 // ── Global function ──
 $d = deepclone_to_array(strlen(...));
-var_dump($d['mask'] === "\x01");
+var_dump($d['mask'] === 0);
 var_dump($d['prepared'][0] === null);
 var_dump($d['prepared'][1] === 'strlen');
 $clone = deepclone_from_array($d);
@@ -42,7 +38,7 @@ var_dump($clone() === 'instance');
 $obj = new ClosureTest();
 $fn = $obj->getPrivateClosure();
 $d = deepclone_to_array($fn);
-var_dump($d['mask'] === "\x01"); // named closure marker
+var_dump($d['mask'] === 0); // named closure marker
 $clone = deepclone_from_array($d);
 var_dump($clone() === 'private');
 
