@@ -42,16 +42,27 @@ namespace {
      *         resource or a non-instantiable class (Reflection*,
      *         *IteratorIterator, anonymous classes, …).
      */
-    function deepclone_to_array(mixed $value): array {}
+    /**
+     * @param list<string>|null $allowedClasses Classes that may be serialized.
+     *        null (default) allows all classes. An empty array allows none.
+     *        Closures require "Closure" in the list.
+     *
+     * @throws \ValueError when $allowedClasses is not valid or a class is not allowed.
+     */
+    function deepclone_to_array(mixed $value, ?array $allowedClasses = null): array {}
 
     /**
      * Reconstruct a PHP value from a payload previously produced by
      * {@see deepclone_to_array()}. Equivalent to
      * {@see \Symfony\Component\VarExporter\DeepCloner::fromArray($data)->clone()}.
      *
-     * @throws \ValueError when $data is malformed.
+     * @param list<string>|null $allowedClasses Classes that may be instantiated.
+     *        null (default) allows all classes. An empty array allows none.
+     *        Closures require "Closure" in the list.
+     *
+     * @throws \ValueError when $data is malformed or a class is not allowed.
      * @throws \DeepClone\ClassNotFoundException when the payload references a
      *         class that no longer exists.
      */
-    function deepclone_from_array(array $data): mixed {}
+    function deepclone_from_array(array $data, ?array $allowedClasses = null): mixed {}
 }

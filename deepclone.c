@@ -210,6 +210,7 @@ struct _dc_ctx {
 	uint32_t       next_obj_id;
 	uint32_t       objects_count;
 	bool           is_static;
+	HashTable     *allowed_ht;     /* allowed class names set (or NULL = all) */
 
 	/* Output structures built incrementally during traversal */
 	zval           classes;        /* deduped class names */
@@ -255,6 +256,7 @@ static void dc_ctx_init(dc_ctx *ctx) {
 	ctx->next_obj_id = 0;
 	ctx->objects_count = 0;
 	ctx->is_static = 1;
+	ctx->allowed_ht = NULL;
 	zend_hash_init(&ctx->scope_cache, 4, NULL, ZVAL_PTR_DTOR, 0);
 	zend_hash_init(&ctx->class_info, 4, NULL, NULL, 0);
 	zend_hash_init(&ctx->proto_cache, 4, NULL, ZVAL_PTR_DTOR, 0);
@@ -298,6 +300,10 @@ static void dc_ctx_destroy(dc_ctx *ctx) {
 	zend_hash_destroy(&ctx->scope_cache);
 	zend_hash_destroy(&ctx->class_info);
 	zend_hash_destroy(&ctx->proto_cache);
+	if (ctx->allowed_ht) {
+		zend_hash_destroy(ctx->allowed_ht);
+		efree(ctx->allowed_ht);
+	}
 }
 
 /* Assign or fetch the deduplicated class index for a class name */
@@ -570,6 +576,48 @@ static bool dc_array_is_static(HashTable *ht)
 	return true;
 }
 
+/* ── Allowed-class validation helpers ──────────────────────── */
+
+/* Build a lowercased name-keyed HashTable from a user-provided list of
+ * class names, validating each entry like unserialize() does. Returns
+ * the set on success (caller must zend_hash_destroy + efree) or NULL on
+ * validation failure (exception already thrown). */
+static HashTable *dc_build_allowed_set(HashTable *list, const char *func_name)
+{
+	HashTable *set = emalloc(sizeof(HashTable));
+	zend_hash_init(set, zend_hash_num_elements(list), NULL, NULL, 0);
+	zval *entry;
+	ZEND_HASH_FOREACH_VAL(list, entry) {
+		if (Z_TYPE_P(entry) != IS_STRING) {
+			zend_hash_destroy(set);
+			efree(set);
+			zend_value_error("%s(): Argument $allowedClasses must be an array of class names, %s given",
+				func_name, zend_zval_value_name(entry));
+			return NULL;
+		}
+		if (!zend_is_valid_class_name(Z_STR_P(entry))) {
+			zend_hash_destroy(set);
+			efree(set);
+			zend_value_error("%s(): Argument $allowedClasses must be an array of class names, \"%s\" given",
+				func_name, ZSTR_VAL(Z_STR_P(entry)));
+			return NULL;
+		}
+		zend_string *lcname = zend_string_tolower(Z_STR_P(entry));
+		zend_hash_add_empty_element(set, lcname);
+		zend_string_release(lcname);
+	} ZEND_HASH_FOREACH_END();
+	return set;
+}
+
+static zend_always_inline bool dc_class_allowed(HashTable *set, zend_string *name)
+{
+	if (!set) return true;
+	zend_string *lcname = zend_string_tolower(name);
+	bool found = zend_hash_exists(set, lcname);
+	zend_string_release(lcname);
+	return found;
+}
+
 /* ── Core traversal ─────────────────────────────────────────── */
 
 /*
@@ -818,6 +866,10 @@ static void dc_copy_value(dc_ctx *ctx, zval *src, zval *dst, zval *mask_dst)
 	if (Z_OBJCE_P(src) == zend_ce_closure) {
 		const zend_function *func = zend_get_closure_method_def(Z_OBJ_P(src));
 		if (func && (func->common.fn_flags & ZEND_ACC_FAKE_CLOSURE)) {
+			if (!dc_class_allowed(ctx->allowed_ht, zend_ce_closure->name)) {
+				zend_value_error("deepclone_to_array(): class \"Closure\" is not allowed");
+				return;
+			}
 			/* Build the encoded callable in dst */
 			array_init_size(dst, 2);
 
@@ -922,6 +974,12 @@ static void dc_process_object(dc_ctx *ctx, zval *src, zval *dst, zval *mask_dst)
 	zval props_zval, retval;
 	bool has_unserialize, need_release_array_value = false;
 	HashTable *sleep_set = NULL;
+
+	/* Reject disallowed classes before any allocation. */
+	if (!dc_class_allowed(ctx->allowed_ht, ce->name)) {
+		zend_value_error("deepclone_to_array(): class \"%s\" is not allowed", ZSTR_VAL(ce->name));
+		return;
+	}
 
 	/* Allocate pool entry */
 	dc_pool_entry *entry = emalloc(sizeof(dc_pool_entry));
@@ -1699,9 +1757,12 @@ static void dc_build_output(dc_ctx *ctx, zval *prepared, zval *top_mask, zval *r
 PHP_FUNCTION(deepclone_to_array)
 {
 	zval *value;
+	HashTable *allowed_ht = NULL;
 
-	ZEND_PARSE_PARAMETERS_START(1, 1)
+	ZEND_PARSE_PARAMETERS_START(1, 2)
 		Z_PARAM_ZVAL(value)
+		Z_PARAM_OPTIONAL
+		Z_PARAM_ARRAY_HT_OR_NULL(allowed_ht)
 	ZEND_PARSE_PARAMETERS_END();
 
 	/* Reject resources at the top level just like the walker does mid-tree.
@@ -1730,6 +1791,13 @@ PHP_FUNCTION(deepclone_to_array)
 
 	dc_ctx ctx;
 	dc_ctx_init(&ctx);
+	if (allowed_ht) {
+		ctx.allowed_ht = dc_build_allowed_set(allowed_ht, "deepclone_to_array");
+		if (!ctx.allowed_ht) {
+			dc_ctx_destroy(&ctx);
+			return;
+		}
+	}
 
 	zval prepared, top_mask;
 	ZVAL_UNDEF(&prepared);
@@ -2068,9 +2136,32 @@ static void dc_resolve(zval *value, zval *mask, zval *objects, HashTable *refs, 
 	} while (0)
 #define DC_REQUIRE(cond, ...) do { if (UNEXPECTED(!(cond))) DC_INVALID(__VA_ARGS__); } while (0)
 
+/* Recursively scan a mask zval tree for LONG(0) entries (named-closure
+ * markers). Returns true as soon as one is found. */
+static bool dc_mask_has_closure(zval *mask)
+{
+	if (mask == NULL) {
+		return false;
+	}
+	if (Z_TYPE_P(mask) == IS_LONG && Z_LVAL_P(mask) == 0) {
+		return true;
+	}
+	if (Z_TYPE_P(mask) != IS_ARRAY) {
+		return false;
+	}
+	zval *v;
+	ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(mask), v) {
+		if (dc_mask_has_closure(v)) {
+			return true;
+		}
+	} ZEND_HASH_FOREACH_END();
+	return false;
+}
+
 PHP_FUNCTION(deepclone_from_array)
 {
 	HashTable *data_ht;
+	HashTable *allowed_ht = NULL;
 	HashTable class_list;
 	HashTable ce_cache;
 	HashTable refs;
@@ -2082,8 +2173,10 @@ PHP_FUNCTION(deepclone_from_array)
 	bool refs_inited = false;
 	bool objects_inited = false;
 
-	ZEND_PARSE_PARAMETERS_START(1, 1)
+	ZEND_PARSE_PARAMETERS_START(1, 2)
 		Z_PARAM_ARRAY_HT(data_ht)
+		Z_PARAM_OPTIONAL
+		Z_PARAM_ARRAY_HT_OR_NULL(allowed_ht)
 	ZEND_PARSE_PARAMETERS_END();
 
 	/* Static value: return data['value'] */
@@ -2140,6 +2233,68 @@ PHP_FUNCTION(deepclone_from_array)
 			}
 			zend_hash_index_add(&class_list, num_classes++, cls);
 		} ZEND_HASH_FOREACH_END();
+	}
+
+	/* ── Validate allowed classes ──────────────── */
+	if (allowed_ht) {
+		HashTable *allowed_set = dc_build_allowed_set(allowed_ht, "deepclone_from_array");
+		if (!allowed_set) {
+			goto cleanup;
+		}
+
+		/* Check every class in the payload against the set. */
+		for (uint32_t i = 0; i < num_classes; i++) {
+			zval *cls = zend_hash_index_find(&class_list, i);
+			if (!dc_class_allowed(allowed_set, Z_STR_P(cls))) {
+				zend_hash_destroy(allowed_set);
+				efree(allowed_set);
+				DC_INVALID("deepclone_from_array(): class \"%s\" is not allowed", ZSTR_VAL(Z_STR_P(cls)));
+			}
+		}
+
+		/* Check for named closures if Closure is not allowed. */
+		bool closure_allowed = dc_class_allowed(allowed_set, zend_ce_closure->name);
+		zend_hash_destroy(allowed_set);
+		efree(allowed_set);
+
+		if (!closure_allowed) {
+			/* Scan mask, resolve, refMasks, and state masks for the
+			 * named-closure marker (IS_LONG, value 0). */
+			if (dc_mask_has_closure(zmask)) {
+				DC_INVALID("deepclone_from_array(): class \"Closure\" is not allowed");
+			}
+			if (zresolve) {
+				zval *scope;
+				ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(zresolve), scope) {
+					if (Z_TYPE_P(scope) != IS_ARRAY) continue;
+					zval *name;
+					ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(scope), name) {
+						if (dc_mask_has_closure(name)) {
+							DC_INVALID("deepclone_from_array(): class \"Closure\" is not allowed");
+						}
+					} ZEND_HASH_FOREACH_END();
+				} ZEND_HASH_FOREACH_END();
+			}
+			if (zref_masks) {
+				zval *rmask;
+				ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(zref_masks), rmask) {
+					if (dc_mask_has_closure(rmask)) {
+						DC_INVALID("deepclone_from_array(): class \"Closure\" is not allowed");
+					}
+				} ZEND_HASH_FOREACH_END();
+			}
+			if (zstates) {
+				zval *state;
+				ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(zstates), state) {
+					if (Z_TYPE_P(state) == IS_ARRAY) {
+						zval *smask = zend_hash_index_find(Z_ARRVAL_P(state), 2);
+						if (smask && dc_mask_has_closure(smask)) {
+							DC_INVALID("deepclone_from_array(): class \"Closure\" is not allowed");
+						}
+					}
+				} ZEND_HASH_FOREACH_END();
+			}
+		}
 	}
 
 	/* ── Build objectMeta: id → [class_name, wakeup] ── */
