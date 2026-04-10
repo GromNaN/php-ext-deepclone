@@ -395,12 +395,15 @@ static uint8_t dc_get_class_info(dc_ctx *ctx, zend_class_entry *ce)
 	}
 
 	/* Internal classes with C-level state (create_object != NULL):
-	 *   Rule A: final + create_object → always reject (no escape hatch).
-	 *   Rule B: non-final + create_object + no serialization API → reject.
-	 * Classes with __serialize/__unserialize/__sleep/__wakeup are trusted. */
+	 *   Rule A: final + no serialization API → reject.
+	 *   Rule B: non-final + no serialization API → reject.
+	 * Classes declaring __serialize/__unserialize/__sleep/__wakeup are trusted:
+	 * they round-trip via object_init_ex() + __unserialize(), same as PHP's
+	 * own serialize/unserialize. */
 	if (ce->type == ZEND_INTERNAL_CLASS
 	 && ce->create_object != NULL
 	 && (ce->ce_flags & ZEND_ACC_FINAL)
+	 && !(flags & (DC_CI_HAS_SERIALIZE | DC_CI_HAS_UNSERIALIZE | DC_CI_HAS_SLEEP | DC_CI_HAS_WAKEUP))
 	 && ce != php_ce_incomplete_class) {
 		flags |= DC_CI_NOT_INSTANTIABLE;
 	} else if (ce->type == ZEND_INTERNAL_CLASS
