@@ -21,29 +21,35 @@ This extension preserves PHP's copy-on-write: strings and scalar arrays are
 shared between clones until they are actually modified.
 
 ```php
-$cloner = new DeepCloner($prototype);
+$payload = deepclone_to_array($prototype);
 for ($i = 0; $i < 1000; $i++) {
-    $clone = $cloner->clone();  // fast, COW-friendly
+    $clone = deepclone_from_array($payload);  // fast, COW-friendly
 }
 ```
 
-**OPcache-friendly cache format.** `DeepCloner::toArray()` produces a plain
-PHP array suitable for `var_export()`. When cached in a `.php` file, OPcache
-maps it into shared memory — making the "unserialize" step essentially free:
+**OPcache-friendly cache format.** The pure-array payload is suitable for
+`var_export()`. When cached in a `.php` file, OPcache maps it into shared
+memory — making the "unserialize" step essentially free:
 
 ```php
 // Write:
-file_put_contents('cache.php', '<?php return ' . VarExporter::export($cloner->toArray()) . ';');
+file_put_contents('cache.php', '<?php return ' . var_export(deepclone_to_array($graph), true) . ';');
 
 // Read (OPcache serves this from SHM):
-$cloner = DeepCloner::fromArray(require 'cache.php');
-$value  = $cloner->clone();
+$clone = deepclone_from_array(require 'cache.php');
 ```
 
 **Serialization to any format.** The array form can be passed to
 `json_encode()`, MessagePack, igbinary, APCu, or any transport that handles
 plain PHP arrays — without losing object identity, cycles, references, or
 private property state.
+
+```php
+$payload = deepclone_to_array($graph);
+$json = json_encode($payload);   // safe — no objects in the array
+// ... send over the wire, store in a DB, etc.
+$clone = deepclone_from_array(json_decode($json, true));
+```
 
 ## API
 
@@ -107,17 +113,10 @@ sudo make install
 
 ## With Symfony
 
-If `symfony/var-exporter` is installed, `DeepCloner` picks up the extension
-automatically — no code change needed:
-
-```php
-use Symfony\Component\VarExporter\DeepCloner;
-
-$clone = DeepCloner::deepClone($graph);  // 4-5× faster with the extension
-```
-
-Without the extension, `DeepCloner` falls back to the pure-PHP polyfill
-(`symfony/polyfill-deepclone`), which produces the same wire format.
+`symfony/var-exporter` and `symfony/polyfill-deepclone` provide the same
+`deepclone_to_array()` / `deepclone_from_array()` functions in pure PHP.
+When this extension is loaded it replaces the polyfill transparently —
+no code change needed, just a 4–5× speedup.
 
 ## License
 
