@@ -1396,15 +1396,21 @@ prepare_props:
 					out_name = zend_hash_add_new(Z_ARRVAL_P(out_scope), name, &new_ht);
 				}
 
-				/* Reserve dst slot at properties[scope][name][id] */
-				zval undef;
-				ZVAL_UNDEF(&undef);
-				zval *dst_slot = zend_hash_index_add_new(Z_ARRVAL_P(out_name), entry_id, &undef);
+				/* Copy value into a local zval first; only then insert into the
+				 * HashTable.  We must NOT pre-allocate a slot and pass its address
+				 * to dc_copy_value: the HashTable for out_name may grow (and thus
+				 * reallocate its arPacked) during the recursive call, turning the
+				 * pre-obtained pointer into a dangling pointer. */
+				zval local_value;
+				ZVAL_UNDEF(&local_value);
 
 				/* Mask slot: lazily allocate resolve[scope][name][id] */
 				zval mask_slot_zv;
 				ZVAL_UNDEF(&mask_slot_zv);
-				dc_copy_value(ctx, raw_val, dst_slot, &mask_slot_zv);
+				dc_copy_value(ctx, raw_val, &local_value, &mask_slot_zv);
+
+				/* HashTable is stable now — insert the finished value. */
+				zend_hash_index_add_new(Z_ARRVAL_P(out_name), entry_id, &local_value);
 				/* Drop the IS_NULL placeholders that dc_copy_array() seeded
 				 * for elements that didn't need a marker. */
 				dc_mask_cleanup(&mask_slot_zv);
